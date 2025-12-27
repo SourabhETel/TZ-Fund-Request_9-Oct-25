@@ -147,6 +147,22 @@ function upsertVehicleSummaryRow(sheetName, rowData, keyType) {
     } else {
       sh.appendRow(rowValues);
     }
+    
+    // [FIREBASE HOOK] Sync to Firestore
+    try {
+       const map = {
+         'Vehicle_InUse': 'vehicle_in_use',
+         'Vehicle_Released': 'vehicle_released',
+         'Vehicle_History': 'vehicle_history',
+         'vehicle_in_use': 'vehicle_in_use' // alias
+       };
+       const collection = map[sheetName];
+       if (collection) {
+          persistRowToFirestore(collection, keyColumnName, rowData);
+       }
+    } catch (fsErr) {
+       console.warn('Firestore sync failed for ' + sheetName, fsErr);
+    }
   } catch (err) {
     console.error('upsertVehicleSummaryRow failed:', err, { sheetName, keyType });
   }
@@ -5189,6 +5205,17 @@ function releaseCarUser(payload) {
     try { CacheService.getScriptCache().remove('VEH_PICKER_V1'); } catch (_cacheErr) { /* ignore */ }
     invalidateVehicleInUseCache();
     invalidateVehicleReleasedCache('User release updated assignments');
+    
+    // [FIREBASE HOOK] Sync CarT_P Updates (Batch)
+    try {
+      if (newRows && newRows.length) {
+        newRows.forEach(row => {
+          persistRowToFirestore('cartp_plan', 'Ref', row, header);
+        });
+      }
+    } catch (fsErr) {
+      console.warn('Firestore sync failed for CarT_P (releaseCarUser)', fsErr);
+    }
 
     return {
       ok: true,
@@ -5422,6 +5449,13 @@ function changeVehicleResponsibleBeneficiary(carNumber, beneficiaryName, options
     } catch (syncErr) {
       console.warn('syncVehicleSheetFromCarTP failed after responsible change:', syncErr);
     }
+    
+    // [FIREBASE HOOK] Sync CarT_P Update
+    try {
+      persistRowToFirestore('cartp_plan', 'Ref', baseRow, header);
+    } catch (fsErr) {
+      console.warn('Firestore sync failed for CarT_P (changeVehicleResponsibleBeneficiary)', fsErr);
+    }
 
     const updatedDetails = getCarReleaseDetails(targetCarRaw);
 
@@ -5609,6 +5643,13 @@ function addVehicleSecondaryBeneficiary(carNumber, beneficiaryName, options) {
     try { invalidateVehicleReleasedCache('Vehicle beneficiary added'); } catch (_e) {}
     try { refreshVehicleStatusSheets(); } catch (refreshErr) { console.warn('refreshVehicleStatusSheets failed after secondary beneficiary add:', refreshErr); }
     try { syncVehicleSheetFromCarTP(); } catch (syncErr) { console.warn('syncVehicleSheetFromCarTP failed after secondary beneficiary add:', syncErr); }
+    
+    // [FIREBASE HOOK] Sync CarT_P Update
+    try {
+      persistRowToFirestore('cartp_plan', 'Ref', baseRow, header);
+    } catch (fsErr) {
+      console.warn('Firestore sync failed for CarT_P (addVehicleSecondaryBeneficiary)', fsErr);
+    }
 
     const updatedDetails = getCarReleaseDetails(targetCarRaw);
     return {
@@ -8604,6 +8645,13 @@ function releaseBeneficiary(payload) {
     }
 
     sh.appendRow(newRow);
+    
+    // [FIREBASE HOOK] Sync DD Update
+    try {
+      persistRowToFirestore('dd_beneficiaries', 'Beneficiary', newRow, header);
+    } catch (fsErr) {
+      console.warn('Firestore sync failed for DD (releaseBeneficiary)', fsErr);
+    }
 
     try { bustDDCache(); } catch (cacheErr) { console.warn('releaseBeneficiary: bustDDCache failed', cacheErr); }
 

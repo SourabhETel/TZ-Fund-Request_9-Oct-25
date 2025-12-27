@@ -176,6 +176,100 @@ function firestoreBatchWrite_(collectionName, docs) {
 }
 
 /**
+ * Persist a single row from a sheet (or row-like object) to Firestore.
+ * Used for real-time hooks.
+ * @param {string} collectionName Target collection
+ * @param {string} idFieldHeader Header name to use as ID (optional)
+ * @param {number|Object} rowData Either an array of values (if header provided) or an object (map).
+ * @param {Array<string>} [headerRow] Header array if rowData is an array.
+ */
+function persistRowToFirestore(collectionName, idFieldHeader, rowData, headerRow) {
+  try {
+    let doc = {};
+    let docId = null;
+
+    if (Array.isArray(rowData) && Array.isArray(headerRow)) {
+       // Array mode
+       const headers = headerRow.map(h => toCamelCase_(h));
+       let idColIdx = -1;
+       if (idFieldHeader) {
+          const normId = toCamelCase_(idFieldHeader);
+          idColIdx = headers.indexOf(normId);
+          if (idColIdx === -1) {
+            idColIdx = headerRow.findIndex(h => String(h).trim().toLowerCase() === String(idFieldHeader).trim().toLowerCase());
+          }
+       }
+       if (idColIdx !== -1) {
+         const val = String(rowData[idColIdx]||'').trim();
+         if (val) docId = sanitizeDocId_(val);
+       }
+
+       rowData.forEach((cell, idx) => {
+          const key = headers[idx];
+          if (!key) return;
+          const val = normalizeValueForFirestore_(cell);
+          if (val !== null && val !== '' && val !== undefined) {
+            doc[key] = val;
+          }
+       });
+    } else if (typeof rowData === 'object') {
+       // Object mode (already keyed) - we assume keys are close to desired, but maybe we should normalize?
+       // If coming from `upsertVehicleSummaryRow` rowData is an object with headers as keys.
+       // So we need to normalize keys.
+       
+       for (const [k, v] of Object.entries(rowData)) {
+         const key = toCamelCase_(k);
+         const val = normalizeValueForFirestore_(v);
+         if (val !== null && val !== '' && val !== undefined) {
+           doc[key] = val;
+         }
+         // ID check
+         if (idFieldHeader && (k === idFieldHeader || key === toCamelCase_(idFieldHeader))) {
+            const idVal = String(v||'').trim();
+            if (idVal) docId = sanitizeDocId_(idVal);
+         }
+       }
+    }
+
+    if (Object.keys(doc).length === 0) return; // empty
+
+    const projectId = getFirestoreProjectId_();
+    
+    // Construct Path
+    const finalId = docId || Utilities.getUuid();
+    const docPath = `projects/${projectId}/databases/(default)/documents/${collectionName}/${finalId}`;
+    
+    // REST API patch (upsert)
+    // We use patch to allow merging or set fields.
+    // To mimic "set" (overwrite), we don't use updateMask.
+    
+    const url = `https://firestore.googleapis.com/v1/${docPath}`;
+    const token = getFirestoreAccessToken_();
+    
+    const payload = {
+      name: docPath,
+      fields: firestoreFields_(doc)
+    };
+    
+    const response = UrlFetchApp.fetch(url, {
+       method: 'patch',
+       headers: { Authorization: `Bearer ${token}` },
+       contentType: 'application/json',
+       payload: JSON.stringify(payload),
+       muteHttpExceptions: true
+     });
+     
+     if (response.getResponseCode() >= 300) {
+       console.error(`Persist row failed: ${response.getContentText()}`);
+     } else {
+       console.log(`Persisted doc to ${collectionName}/${finalId}`);
+     }
+  } catch (e) {
+    console.warn('persistRowToFirestore error', e);
+  }
+}
+
+/**
  * Helper: toCamelCase
  * e.g. "Fuel Amount" -> "fuelAmount"
  */
@@ -276,9 +370,19 @@ function syncSubmissionsToFirestore() {
     submitter: findIdx(['Submitter']),
     approvalDate: findIdx(['Approval date']),
     approvedBy: findIdx(['Approved by']),
-    paidAmt: findIdx(['Paid amt']),
+    paidAmt: findIdx(['Paid amt', 'Paid Amount']),
     transferBy: findIdx(['Transfer By']),
-    finRemarks: findIdx(['Finance Remarks'])
+    finRemarks: findIdx(['Finance Remarks']),
+    
+    // [NEW] Finance Fields
+    dateP: findIdx(['Date P']),
+    advRef: findIdx(['Adv Ref']),
+    claimBal: findIdx(['Claim/Balance amt', 'Claim/Balance Amount']),
+    balAmt: findIdx(['Balance Amt', 'Balance Amount']),
+    vchType: findIdx(['Vch Type-Pymt', 'Vch Type']),
+    jv: findIdx(['JV']),
+    transferTo: findIdx(['Transfer To']),
+    mode: findIdx(['Mode'])
   };
 
   const documents = [];
@@ -300,10 +404,8 @@ function syncSubmissionsToFirestore() {
     };
     const date = (idx) => {
        const v = val(idx);
-       if (v instanceof Date) return normalizeValueForFirestore_(v); // keep as ISO string or timestamp
+       if (v instanceof Date) return normalizeValueForFirestore_(v); 
        if (!v) return null;
-       // try parsing if string? using existing parseDate or logic?
-       // For sync, let's trust row value if it's already a date object, else string.
        return v; 
     };
     const str = (idx) => {
@@ -365,9 +467,19 @@ function syncSubmissionsToFirestore() {
          submitter: str(IDX.submitter),
          approvalDate: date(IDX.approvalDate) || '',
          approvedBy: str(IDX.approvedBy),
+         
+         // Finance / Payment Fields
          paidAmt: num(IDX.paidAmt),
          transferBy: str(IDX.transferBy),
-         financeRemarks: str(IDX.finRemarks)
+         financeRemarks: str(IDX.finRemarks),
+         dateP: date(IDX.dateP) || '',
+         advRef: str(IDX.advRef),
+         claimBalAmt: num(IDX.claimBal),
+         balanceAmt: num(IDX.balAmt),
+         vchType: str(IDX.vchType),
+         jv: str(IDX.jv),
+         transferTo: str(IDX.transferTo),
+         mode: str(IDX.mode)
        }],
        
        metadata: {
