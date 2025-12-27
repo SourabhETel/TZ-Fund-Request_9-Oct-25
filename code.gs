@@ -3722,6 +3722,69 @@ function submitToSubmissions(submissionData) {
       submitter: submissionData.rows[0]?.submitter || '',
       timestamp: timestamp
     });
+    try {
+      persistSubmissionToFirestore({
+        submissionId: submissionId,
+        project: submissionData.rows[0]?.projectName || submissionData.rows[0]?.project || '',
+        submitter: submissionData.rows[0]?.submitter || '',
+        timestamp: timestamp,
+        rows: submissionData.rows.map(r => ({
+          beneficiary: (r.beneficiary || '').toString().trim(),
+          accountHolder: (r.accountHolder || '').toString().trim(),
+          teamName: (r.teamName || r.team || '').toString().trim(),
+          projectName: (r.projectName || r.project || '').toString().trim(),
+          total: Number(r.total || 0),
+          designation: (r.designation || '').toString().trim(),
+          fuel: {
+            from: parseDate(r.fuel?.from || ''),
+            to: parseDate(r.fuel?.to || ''),
+            amount: Number(r.fuel?.amount || 0)
+          },
+          da: {
+            from: parseDate(r.da?.from || ''),
+            to: parseDate(r.da?.to || ''),
+            amount: Number(r.da?.amount || 0)
+          },
+          car: {
+            from: parseDate(r.car?.from || ''),
+            to: parseDate(r.car?.to || ''),
+            vehicleNumber: (r.vehicleNumber || '').toString().trim(),
+            amount: Number(r.car?.amount || 0)
+          },
+          air: {
+             from: parseDate(r.air?.from || ''),
+             to: parseDate(r.air?.to || ''),
+             amount: Number(r.air?.amount || 0)
+          },
+          transport: {
+            from: parseDate(r.transport?.from || ''),
+            to: parseDate(r.transport?.to || ''),
+            amount: Number(r.transport?.amount || 0)
+          },
+          misc: {
+            from: parseDate(r.misc?.from || ''),
+            to: parseDate(r.misc?.to || ''),
+            amount: Number(r.misc?.amount || 0)
+          },
+          mob: (r.mob || '').toString().trim(),
+          displayName: (r.displayName || '').toString().trim(),
+          whCharges: Number(r.whCharges || 0),
+          remarks: (r.remarks || '').toString().trim(),
+          submitter: (r.submitter || '').toString().trim(),
+          approvalDate: parseDate(r.approvalDate || ''),
+          approvedBy: (r.approvedBy || '').toString().trim(),
+          paidAmt: Number(r.paidAmt || 0),
+          transferBy: (r.transferBy || '').toString().trim(),
+          financeRemarks: (r.financeRemarks || '').toString().trim()
+        })),
+        metadata: {
+          rowCount: submissionData.rows.length,
+          hasViolations: !!submissionData.hasViolations
+        }
+      });
+    } catch (firestoreErr) {
+      console.warn('Persisting to Firestore failed for submission', submissionId, firestoreErr);
+    }
 
     return { 
       ok: true, 
