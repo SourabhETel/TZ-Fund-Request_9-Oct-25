@@ -376,7 +376,7 @@ function syncSubmissionsToFirestore() {
     
     // [NEW] Finance Fields
     dateP: findIdx(['Date P']),
-    advRef: findIdx(['Adv Ref']),
+    advRef: findIdx(['Adv Ref', 'Ref', 'Reference']),
     claimBal: findIdx(['Claim/Balance amt', 'Claim/Balance Amount']),
     balAmt: findIdx(['Balance Amt', 'Balance Amount']),
     vchType: findIdx(['Vch Type-Pymt', 'Vch Type']),
@@ -385,160 +385,148 @@ function syncSubmissionsToFirestore() {
     mode: findIdx(['Mode'])
   };
 
-  const documents = [];
+  const groups = {}; // Map<SubmissionID, Array<Row>>
 
+  // 1. Group Rows by Submission ID
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    
-    // Get ID or generate
-    let docId = null;
+    let subId = null;
     if (IDX.id !== -1) {
       const val = String(row[IDX.id]||'').trim();
-      if (val) docId = sanitizeDocId_(val);
+      if (val) subId = sanitizeDocId_(val);
     }
     
-    const val = (idx) => (idx !== -1 && row[idx] !== undefined) ? row[idx] : null;
-    const num = (idx) => {
-       const v = val(idx); 
-       return (typeof v === 'number') ? v : Number(parseAmount(v));
-    };
-    const date = (idx) => {
-       const v = val(idx);
-       if (v instanceof Date) return normalizeValueForFirestore_(v); 
-       if (!v) return null;
-       return v; 
-    };
-    const str = (idx) => {
-      const v = val(idx);
+    // If no ID, generate one for the group (assuming single-row submission if missing ID, or skip?)
+    // Creating orphan groups for missing IDs might be messy, but safer than skipping.
+    if (!subId) {
+       subId = 'orphan_' + Utilities.getUuid();
+    }
+    
+    if (!groups[subId]) groups[subId] = [];
+    groups[subId].push(row);
+  }
+
+  // 2. Prepare Batch Writes
+  const writes = [];
+  const projectId = getFirestoreProjectId_(); // Assumes firestore.gs is loaded
+  const databaseRoot = `projects/${projectId}/databases/(default)/documents`;
+
+  Object.entries(groups).forEach(([subId, rows]) => {
+    // A. Parse Parent Data (from first row)
+    const firstRow = rows[0];
+    
+    const val = (r, idx) => (idx !== -1 && r[idx] !== undefined) ? r[idx] : null;
+    const str = (r, idx) => {
+      const v = val(r, idx);
       return (v === null || v === undefined) ? '' : String(v).trim();
     };
+    const date = (r, idx) => {
+        const v = val(r, idx);
+        if (v instanceof Date) return normalizeValueForFirestore_(v); 
+        if (!v) return null;
+        return v; 
+    };
 
-    const doc = {
-       submissionId: docId || '',
-       timestamp: date(IDX.timestamp),
-       project: str(IDX.project),
-       submitter: str(IDX.submitter),
-       
-       // Reconstruct row structure to match submitToSubmissions
-       rows: [{
-         beneficiary: str(IDX.beneficiary),
-         accountHolder: str(IDX.accountHolder),
-         teamName: str(IDX.team),
-         projectName: str(IDX.project),
-         total: num(IDX.total),
-         designation: str(IDX.designation),
-         
-         fuel: {
-           from: date(IDX.fuelFrom) || '',
-           to: date(IDX.fuelTo) || '',
-           amount: num(IDX.fuelAmt)
-         },
-         da: {
-           from: date(IDX.daFrom) || '',
-           to: date(IDX.daTo) || '',
-           amount: num(IDX.daAmt)
-         },
-         car: {
-           from: date(IDX.carFrom) || '',
-           to: date(IDX.carTo) || '',
-           vehicleNumber: str(IDX.carNum),
-           amount: num(IDX.carAmt)
-         },
-         air: {
-           from: date(IDX.airFrom) || '',
-           to: date(IDX.airTo) || '',
-           amount: num(IDX.airAmt)
-         },
-         transport: {
-           from: date(IDX.transFrom) || '',
-           to: date(IDX.transTo) || '',
-           amount: num(IDX.transAmt)
-         },
-         misc: {
-           from: date(IDX.miscFrom) || '',
-           to: date(IDX.miscTo) || '',
-           amount: num(IDX.miscAmt)
-         },
-         
-         mob: str(IDX.mob),
-         displayName: str(IDX.display),
-         whCharges: num(IDX.wh),
-         remarks: str(IDX.remarks),
-         submitter: str(IDX.submitter),
-         approvalDate: date(IDX.approvalDate) || '',
-         approvedBy: str(IDX.approvedBy),
-         
-         // Finance / Payment Fields
-         paidAmt: num(IDX.paidAmt),
-         transferBy: str(IDX.transferBy),
-         financeRemarks: str(IDX.finRemarks),
-         dateP: date(IDX.dateP) || '',
-         advRef: str(IDX.advRef),
-         claimBalAmt: num(IDX.claimBal),
-         balanceAmt: num(IDX.balAmt),
-         vchType: str(IDX.vchType),
-         jv: str(IDX.jv),
-         transferTo: str(IDX.transferTo),
-         mode: str(IDX.mode)
-       }],
-       
-       metadata: {
-         rowCount: 1, // Submissions tab is flat, 1 row per doc usually in this legacy view? 
-                      // actually submitToSubmissions writes 1 doc per submission which can have multiple rows.
-                      // BUT, the sheet basically flattens it? 
-                      // Wait, current sheet structure: 1 row per "item".
-                      // If a submission had 5 rows, the sheet has 5 rows.
-                      // Does the sheet share a 'Submission ID' across 5 rows? Yes.
-                      // So we should GROUP by Submission ID?
-                      // The current generic sync was treating each row as a doc. 
-                      // `submitToSubmissions` creates ONE doc for multiple rows.
-                      // If I want to match, I must Group By Submission ID.
-          backfilled: true
-       }
+    const parentPath = `${collectionName}/${subId}`;
+    const parentData = {
+        submissionId: subId,
+        project: str(firstRow, IDX.project),
+        submitter: str(firstRow, IDX.submitter),
+        team: str(firstRow, IDX.team), // [NEW] Optimized Query Field
+        totalAmount: rows.reduce((sum, r) => {
+           const v = val(r, IDX.total);
+           const amount = (typeof v === 'number') ? v : Number(parseAmount(v)) || 0;
+           return sum + amount;
+        }, 0), // [NEW] Optimized Query Field
+        timestamp: date(firstRow, IDX.timestamp), // Use first row's timestamp
+        rowCount: rows.length,
+        metadata: {
+          backfilled: true,
+          syncedAt: new Date().toISOString()
+        },
+        createdAt: new Date().toISOString()
     };
     
-    documents.push(doc);
-  }
-  
-  // GROUP BY Submission ID
-  const grouped = {};
-  documents.forEach(d => {
-    const key = d.submissionId;
-    // If no ID, generate unique? legacy data might check uniqueness?
-    // If key is empty, treat as individual doc? 
-    if (!key) {
-      // no grouping possible
-      grouped[Utilities.getUuid()] = d; // single
-    } else {
-      if (!grouped[key]) {
-        grouped[key] = d; // init
-      } else {
-        // merge rows
-        grouped[key].rows.push(d.rows[0]);
-        // Update totals?
-        grouped[key].metadata.rowCount += 1;
+    writes.push({
+      update: {
+        name: `${databaseRoot}/${parentPath}`,
+        fields: firestoreFields_(parentData)
       }
-    }
-  });
-  
-  const finalDocs = Object.entries(grouped).map(([id, doc]) => {
-     return {
-       id: id,
-       fields: doc
-     };
+    });
+    
+    // B. Parse & Write Line Items
+    rows.forEach((r, idx) => {
+      const num = (idx) => {
+         const v = val(r, idx); 
+         return (typeof v === 'number') ? v : Number(parseAmount(v));
+      };
+      // helper for dates in row
+      const d = (idx) => date(r, idx) || '';
+
+      const lineId = `row_${idx}`;
+      const linePath = `${parentPath}/lines/${lineId}`;
+      
+      const lineData = {
+         beneficiary: str(r, IDX.beneficiary),
+         accountHolder: str(r, IDX.accountHolder),
+         Ref: str(r, IDX.advRef), // Mapping Adv Ref to Ref
+         project: str(r, IDX.project),
+         team: str(r, IDX.team),
+         submitter: str(r, IDX.submitter),
+         total: num(IDX.total),
+         designation: str(r, IDX.designation),
+         
+         fuel: { from: d(IDX.fuelFrom), to: d(IDX.fuelTo), amount: num(IDX.fuelAmt) },
+         da: { from: d(IDX.daFrom), to: d(IDX.daTo), amount: num(IDX.daAmt) },
+         car: { from: d(IDX.carFrom), to: d(IDX.carTo), vehicleNumber: str(r, IDX.carNum), amount: num(IDX.carAmt) },
+         air: { from: d(IDX.airFrom), to: d(IDX.airTo), amount: num(IDX.airAmt) },
+         transport: { from: d(IDX.transFrom), to: d(IDX.transTo), amount: num(IDX.transAmt) },
+         misc: { from: d(IDX.miscFrom), to: d(IDX.miscTo), amount: num(IDX.miscAmt) },
+         
+         timestamp: parentData.timestamp, // Legacy/Consistency
+         
+         // Extra fields
+         mob: str(r, IDX.mob),
+         displayName: str(r, IDX.display),
+         whCharges: num(IDX.wh),
+         remarks: str(r, IDX.remarks),
+         approvalDate: d(IDX.approvalDate),
+         approvedBy: str(r, IDX.approvedBy),
+         paidAmt: num(IDX.paidAmt),
+         transferBy: str(r, IDX.transferBy),
+         financeRemarks: str(r, IDX.finRemarks),
+         dateP: d(IDX.dateP),
+         claimBalAmt: num(IDX.claimBal),
+         balanceAmt: num(IDX.balAmt),
+         vchType: str(r, IDX.vchType),
+         jv: str(r, IDX.jv),
+         transferTo: str(r, IDX.transferTo),
+         mode: str(r, IDX.mode)
+      };
+      
+      writes.push({
+        update: {
+          name: `${databaseRoot}/${linePath}`,
+          fields: firestoreFields_(lineData)
+        }
+      });
+    });
   });
 
-  console.log(`Backfill: Prepared ${finalDocs.length} submission documents (from ${data.length-1} rows).`);
+  console.log(`Backfill: Prepared ${writes.length} writes (Parents + Lines) for ${Object.keys(groups).length} submissions.`);
 
-  // Batch Write
-  const CHUNK_SIZE = 400;
-  let processed = 0;
-  for (let i = 0; i < finalDocs.length; i += CHUNK_SIZE) {
-    const chunk = finalDocs.slice(i, i + CHUNK_SIZE);
-    firestoreBatchWrite_(collectionName, chunk);
-    processed += chunk.length;
-    console.log(`Synced ${processed}/${finalDocs.length} to ${collectionName}`);
+  // 3. Execute Batch
+  // Check if executeFirestoreBatch is available (from firestore.gs)
+  if (typeof executeFirestoreBatch === 'function') {
+      executeFirestoreBatch(writes);
+  } else {
+      // Fallback if firestore.gs not updated or reachable? 
+      // Should not happen if part of same project, but for safety:
+      console.warn('executeFirestoreBatch not found, using local batch logic??');
+      // If we are here, we can reuse firestore.gs helpers if exposed, else rewrite.
+      // Assuming firestore.gs is loaded.
+      throw new Error('executeFirestoreBatch helper missing. Ensure firestore.gs is updated.');
   }
   
-  return { count: processed };
+  return { count: writes.length };
 }

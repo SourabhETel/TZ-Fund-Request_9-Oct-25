@@ -202,30 +202,144 @@ function persistSubmissionToFirestore(submissionPayload, opts) {
   if (!submissionPayload || typeof submissionPayload !== 'object') {
     throw new Error('A submission payload object is required to persist to Firestore.');
   }
+
   const collection = (opts && opts.collection) || getFirestoreCollectionName_();
-  const rows = Array.isArray(submissionPayload.rows)
-    ? submissionPayload.rows.map(row => normalizeValueForFirestore_(row))
-    : [];
-  const payload = {
-    submissionId: submissionPayload.submissionId || (opts && opts.documentId) || '',
+  const submissionId = submissionPayload.submissionId || (opts && opts.documentId);
+  
+  if (!submissionId) {
+    throw new Error('Submission ID is required for hierarchical storage.');
+  }
+  
+  const projectId = getFirestoreProjectId_();
+  const databaseRoot = `projects/${projectId}/databases/(default)/documents`;
+  
+  // Prepare Line Documents (Subcollection: lines)
+  const rows = Array.isArray(submissionPayload.rows) ? submissionPayload.rows : [];
+  
+  // Calculate Summaries for Parent
+  const totalAmount = rows.reduce((sum, r) => sum + (Number(r.total) || 0), 0);
+  const firstRow = rows[0] || {};
+  // Check payload from code.gs; it maps teamName/team.
+  const team = firstRow.team || firstRow.teamName || ''; 
+
+  // 1. Prepare Parent Document (Submission)
+  const parentPath = `${collection}/${submissionId}`;
+  
+  // Extract strictly parent-level metadata
+  const parentData = {
+    submissionId: submissionId,
     project: submissionPayload.project || '',
     submitter: submissionPayload.submitter || '',
+    team: team, // [NEW] Optimized Query Field
+    totalAmount: totalAmount, // [NEW] Optimized Query Field
     timestamp: submissionPayload.timestamp instanceof Date
       ? submissionPayload.timestamp.toISOString()
       : submissionPayload.timestamp || new Date().toISOString(),
-    rowCount: rows.length,
-    rows: rows,
+    rowCount: rows.length, // Corrected to use hoisted rows
     metadata: normalizeValueForFirestore_(submissionPayload.metadata || {}),
     createdAt: new Date().toISOString()
   };
-  const documentId = submissionPayload.submissionId || (opts && opts.documentId);
-  const firestoreApp = getConfigFirestoreClient_();
-  if (firestoreApp) {
-    const args = [collection, payload];
-    if (documentId) args.push(documentId);
-    return firestoreApp.createDocument.apply(firestoreApp, args);
+  
+  const writes = [];
+  
+  // Write Parent
+  writes.push({
+    update: {
+      name: `${databaseRoot}/${parentPath}`,
+      fields: firestoreFields_(parentData)
+    },
+    // updateMask could be added if we want to merge, but overwrite seems appropriate for new submission
+  });
+  
+  // 2. Prepare Line Documents (Subcollection: lines)
+  // rows array is already defined above
+  
+  rows.forEach((row, index) => {
+    // Generate Row ID: row_0, row_1, etc. or use a provided ID if available
+    const rowId = `row_${index}`; 
+    const linePath = `${parentPath}/lines/${rowId}`;
+    
+    // Normalize and Ensure Schema Fields
+    // User Requirement: beneficiary, accountHolder, Ref, project, team, submitter, total, component maps
+    
+    const lineData = {
+      beneficiary: row.beneficiary || '',
+      accountHolder: row.accountHolder || '',
+      Ref: row.Ref || row.advRef || '', // Mapping Ref
+      project: row.project || row.projectName || '', // Handle varied aliases
+      team: row.team || row.teamName || '',
+      submitter: row.submitter || '',
+      total: row.total || 0,
+      designation: row.designation || '',
+      
+      // Component Maps
+      fuel: normalizeValueForFirestore_(row.fuel || {}),
+      da: normalizeValueForFirestore_(row.da || {}),
+      car: normalizeValueForFirestore_(row.car || {}), // 'Vehicle' category as 'car'
+      air: normalizeValueForFirestore_(row.air || {}),
+      transport: normalizeValueForFirestore_(row.transport || {}),
+      misc: normalizeValueForFirestore_(row.misc || {}),
+      
+      // Extra Fields
+      mob: row.mob || '',
+      displayName: row.displayName || '',
+      whCharges: row.whCharges || 0,
+      remarks: row.remarks || '',
+      approvalDate: row.approvalDate || null,
+      approvedBy: row.approvedBy || '',
+      paidAmt: row.paidAmt || 0,
+      transferBy: row.transferBy || '',
+      financeRemarks: row.financeRemarks || '',
+      
+      timestamp: parentData.timestamp // Ensure document creation time/submission time is recorded
+    };
+
+    writes.push({
+      update: {
+        name: `${databaseRoot}/${linePath}`,
+        fields: firestoreFields_(lineData)
+      }
+    });
+  });
+
+  // 3. Execute Batch Write
+  return executeFirestoreBatch(writes);
+}
+
+/**
+ * Executes a batch of writes using the Firestore REST API `commit` endpoint.
+ */
+function executeFirestoreBatch(writes) {
+  if (!writes || writes.length === 0) return;
+  
+  const projectId = getFirestoreProjectId_();
+  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:commit`;
+  const token = getFirestoreAccessToken_();
+  
+  // Firestore limits batch to 500 writes. Simple chunking if needed, though submissions are unlikely to exceed 500 rows.
+  // maximizing safety:
+  const CHUNK_SIZE = 500;
+  
+  for (let i = 0; i < writes.length; i += CHUNK_SIZE) {
+    const chunk = writes.slice(i, i + CHUNK_SIZE);
+    const payload = { writes: chunk };
+    
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      headers: {
+        Authorization: `Bearer ${token}`
+      },
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    
+    if (response.getResponseCode() >= 300) {
+      throw new Error(`Firestore batch commit failed (${response.getResponseCode()}): ${response.getContentText()}`);
+    }
   }
-  return createFirestoreDocument_(collection, payload, documentId ? { documentId } : undefined);
+  
+  return { count: writes.length };
 }
 
 function getConfigFirestoreClient_() {
@@ -244,3 +358,4 @@ function getConfigFirestoreClient_() {
   }
   return null;
 }
+

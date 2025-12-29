@@ -3728,8 +3728,11 @@ function submitToSubmissions(submissionData) {
       return { ok: false, error: 'No rows to submit' };
     }
 
-    const startRow = sh.getLastRow() + 1;
-    sh.getRange(startRow, 1, data.length, data[0].length).setValues(data);
+    // [DISABLED] Writing to Google Sheet
+    // const startRow = sh.getLastRow() + 1;
+    // sh.getRange(startRow, 1, data.length, data[0].length).setValues(data);
+    const startRow = 0; // Placeholder
+
     
     sendSubmissionReport({
       submissionId: submissionId,
@@ -3747,6 +3750,7 @@ function submitToSubmissions(submissionData) {
         rows: submissionData.rows.map(r => ({
           beneficiary: (r.beneficiary || '').toString().trim(),
           accountHolder: (r.accountHolder || '').toString().trim(),
+          Ref: (r.advRef || r.Ref || '').toString().trim(),
           teamName: (r.teamName || r.team || '').toString().trim(),
           projectName: (r.projectName || r.project || '').toString().trim(),
           total: Number(r.total || 0),
