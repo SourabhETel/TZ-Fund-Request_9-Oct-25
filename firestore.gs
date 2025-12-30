@@ -366,136 +366,238 @@ function getConfigFirestoreClient_() {
  * @param {Object} eventData - The flattened event object (similar to what was written to the sheet).
  */
 /**
- * Persist a vehicle transaction (and its line items) to Firestore hierarchically.
- * Structure: cartp_plan/{transactionId} -> cartp_lines/{itemId}
- * 
- * @param {Object} payload 
- *  {
- *    transactionId: string, // Optional, auto-generated if missing
- *    timestamp: Date|string,
- *    type: 'ASSIGN'|'RELEASE',
- *    submitter: string,
- *    rows: Array<Object> // The line items
- *  }
+ * Fetch a specific vehicle document by Vehicle Number (ID).
+ * Strict 1 Read Cost.
  */
-function persistCarTransactionToFirestore(payload) {
-  if (!payload || !Array.isArray(payload.rows)) {
-    throw new Error('Invalid vehicle transaction payload.');
-  }
-
+function getVehicleDocument(vehicleNumber) {
   const projectId = getFirestoreProjectId_();
-  const databaseRoot = `projects/${projectId}/databases/(default)/documents`;
-  
-  // 1. Prepare Parent Document
-  const collection = 'cartp_plan';
-  const transactionId = payload.transactionId || `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  const parentPath = `${collection}/${transactionId}`;
-  
-  const parentData = {
-     transactionId: transactionId,
-     type: payload.type || 'UNKNOWN',
-     timestamp: payload.timestamp instanceof Date ? payload.timestamp.toISOString() : (payload.timestamp || new Date().toISOString()),
-     submitter: payload.submitter || '',
-     rowCount: payload.rows.length,
-     project: payload.project || '', // top-level summary
-     team: payload.team || '',       // top-level summary
-     createdAt: new Date().toISOString()
-  };
+  const token = getFirestoreAccessToken_();
+  const safeId = String(vehicleNumber).replace(/\//g, '_').trim();
+  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/cart_plan/${safeId}`;
 
-  const writes = [];
-
-  // Write Parent
-  writes.push({
-    update: {
-      name: `${databaseRoot}/${parentPath}`,
-      fields: firestoreFields_(parentData)
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: { Authorization: `Bearer ${token}` },
+      muteHttpExceptions: true
+    });
+    
+    if (response.getResponseCode() === 404) return null;
+    if (response.getResponseCode() !== 200) {
+      throw new Error(`Firestore get failed: ${response.getContentText()}`);
     }
-  });
-
-  // 2. Prepare Child Documents (cartp_lines)
-  payload.rows.forEach((row, index) => {
-     const lineId = row.ref || `row_${index}_${Math.random().toString(36).substr(2, 5)}`;
-     // Ensure we don't have slashes in IDs
-     const safeLineId = String(lineId).replace(/\//g, '_'); 
-     const linePath = `${parentPath}/cartp_lines/${safeLineId}`;
-     
-     // Ensure timestamp is ready for Firestore
-     const ts = row.timestamp instanceof Date ? row.timestamp.toISOString() : (row.timestamp || parentData.timestamp);
-     
-     const lineData = Object.assign({}, row, {
-        timestamp: ts,
-        parentId: transactionId // back-reference for convenience
-     });
-
-     writes.push({
-       update: {
-         name: `${databaseRoot}/${linePath}`,
-         fields: firestoreFields_(lineData)
-       }
-     });
-  });
-
-  // 3. Execute Batch
-  return executeFirestoreBatch(writes);
+    
+    const json = JSON.parse(response.getContentText());
+    if (!json.fields) return null; // Should have fields
+    
+    return parseFirestoreMap_(json.fields);
+  } catch (e) {
+    console.error('getVehicleDocument error:', e);
+    return null;
+  }
 }
 
 /**
- * Retrieve all car events using a Collection Group Query on 'cartp_lines'.
- * effectively flattens the hierarchy for the application view.
+ * Assign crew to a vehicle.
+ * Rule A: If AVAILABLE -> Status=IN_USE, Create Assignment.
+ *         If IN_USE -> Append to activeCrew.
  */
-function getCarEventsFromFirestore() {
+/**
+ * Assign crew to a vehicle.
+ * Rule A: If AVAILABLE -> Status=IN_USE, Create Assignment.
+ *         If IN_USE -> Append to activeCrew.
+ * 
+ * @param {string} vehicleNumber
+ * @param {Object} assignmentData { ref, project, team, submitter }
+ * @param {Array} newCrewList [{name, role, joinedAt}]
+ * @param {Object} vehicleMetadata { make, model, category, owner, usageType } (Optional, for new cars)
+ */
+function assignCrewToVehicle(vehicleNumber, assignmentData, newCrewList, vehicleMetadata) {
+  const currentDoc = getVehicleDocument(vehicleNumber);
+  const projectId = getFirestoreProjectId_();
+  const databaseRoot = `projects/${projectId}/databases/(default)/documents`;
+  const safeId = String(vehicleNumber).replace(/\//g, '_').trim();
+  const docPath = `cart_plan/${safeId}`;
+  
+  // Prepare base object if new (though docs should ideally exist)
+  let docData = currentDoc || {
+    vehicleNumber: vehicleNumber,
+    status: 'AVAILABLE',
+    currentAssignment: null,
+    recentHistory: []
+  };
+
+  // If new doc or updating metadata
+  if (vehicleMetadata) {
+     if (vehicleMetadata.make) docData.make = vehicleMetadata.make;
+     if (vehicleMetadata.model) docData.model = vehicleMetadata.model;
+     if (vehicleMetadata.category) docData.category = vehicleMetadata.category;
+     if (vehicleMetadata.owner) docData.owner = vehicleMetadata.owner;
+     if (vehicleMetadata.usageType) docData.usageType = vehicleMetadata.usageType;
+  }
+
+  const nowStr = new Date().toISOString();
+
+  // Logic: Merge Crew
+  if (docData.status === 'IN_USE' && docData.currentAssignment) {
+     // Append new crew members
+     // Avoid duplicates based on name/role?
+     const existingCrew = docData.currentAssignment.activeCrew || [];
+     newCrewList.forEach(nc => {
+        // Simple duplicate check by name
+        if (!existingCrew.find(c => c.name === nc.name)) {
+           existingCrew.push(nc);
+        }
+     });
+     docData.currentAssignment.activeCrew = existingCrew;
+  } else {
+     // Status is AVAILABLE (or DISCARDED, but assuming we can re-assign)
+     docData.status = 'IN_USE';
+     docData.currentAssignment = {
+        ref: assignmentData.ref,
+        project: assignmentData.project,
+        team: assignmentData.team,
+        startTime: nowStr,
+        submitter: assignmentData.submitter,
+        activeCrew: newCrewList
+     };
+  }
+
+  // Write back (Update/Overwrite)
+  console.log('[FIRESTORE] assignCrewToVehicle - DocPath:', docPath);
+  console.log('[FIRESTORE] assignCrewToVehicle - Is New/Metadata?', !!vehicleMetadata);
+  console.log('[FIRESTORE] assignCrewToVehicle - Final DocData:', JSON.stringify(docData));
+
+  const fields = firestoreFields_(docData);
+  const write = {
+    update: {
+      name: `${databaseRoot}/${docPath}`,
+      fields: fields
+    }
+  };
+  
+  return executeFirestoreBatch([write]);
+}
+
+/**
+ * Handle vehicle release with "Last Man Standing" logic.
+ * Rule B: Remove users. If crew empty -> Status=AVAILABLE.
+ */
+function updateVehicleAsLastManStanding(vehicleNumber, crewNamesToRemove, releaseData) {
+  const docData = getVehicleDocument(vehicleNumber);
+  if (!docData) throw new Error(`Vehicle ${vehicleNumber} not found in Firestore.`);
+  
+  if (docData.status !== 'IN_USE' || !docData.currentAssignment) {
+     console.warn(`Vehicle ${vehicleNumber} is not IN_USE. Release ignored.`);
+     return;
+  }
+
+  const activeCrew = docData.currentAssignment.activeCrew || [];
+  const initialCount = activeCrew.length;
+  
+  // Filter out removed users
+  const remainingCrew = activeCrew.filter(c => !crewNamesToRemove.includes(c.name));
+  
+  if (remainingCrew.length === 0) {
+     // FULL RELEASE
+     docData.status = 'AVAILABLE';
+     
+     // Move assignment to history
+     const historyEntry = {
+        action: 'RELEASE',
+        date: new Date().toISOString(),
+        ref: docData.currentAssignment.ref,
+        project: docData.currentAssignment.project,
+        team: docData.currentAssignment.team,
+        remarks: releaseData.remarks || '',
+        rating: releaseData.rating || 0,
+        releasedCrew: activeCrew // The crew that was just cleared
+     };
+     
+     const history = docData.recentHistory || [];
+     history.unshift(historyEntry);
+     docData.recentHistory = history.slice(0, 5); // Keep last 5
+     
+     docData.currentAssignment = null; // Clear assignment
+     
+  } else {
+     // PARTIAL RELEASE
+     // Status remains IN_USE
+     docData.currentAssignment.activeCrew = remainingCrew;
+     
+     // Log partial release event? Optional. User said "Log a 'Partial Release' entry in recentHistory".
+     const partialEntry = {
+        action: 'PARTIAL_RELEASE',
+        date: new Date().toISOString(),
+        removedCrew: crewNamesToRemove,
+        remainingCount: remainingCrew.length
+     };
+     const history = docData.recentHistory || [];
+     history.unshift(partialEntry);
+     docData.recentHistory = history.slice(0, 5);
+  }
+
+  // Write back
+  const projectId = getFirestoreProjectId_();
+  const databaseRoot = `projects/${projectId}/databases/(default)/documents`;
+  const safeId = String(vehicleNumber).replace(/\//g, '_').trim();
+  const docPath = `cart_plan/${safeId}`;
+
+  const fields = firestoreFields_(docData);
+  const write = {
+    update: {
+      name: `${databaseRoot}/${docPath}`,
+      fields: fields
+    }
+  };
+  
+  return executeFirestoreBatch([write]);
+}
+
+
+/**
+ * Helper: Run a cheap query to get available or active cars.
+ * Limit is mandatory.
+ */
+function queryVehiclesByStatus(status, limit) {
   const projectId = getFirestoreProjectId_();
   const token = getFirestoreAccessToken_();
-  
-  // Use runQuery to perform a Collection Group Query
   const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
-  
-  const queryPayload = {
+
+  const payload = {
     structuredQuery: {
-      from: [{ collectionId: 'cartp_lines', allDescendants: true }],
-      orderBy: [{ field: { fieldPath: 'timestamp' }, direction: 'ASCENDING' }]
+      from: [{ collectionId: 'cart_plan' }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: 'status' },
+          op: 'EQUAL', 
+          value: { stringValue: status }
+        }
+      },
+      limit: limit || 20
     }
   };
 
-  // Note: runQuery returns a stream of results, potentially paginated or just a list
-  // The REST API for runQuery usually returns a JSON list of objects, usually [{document:..., readTime:...}]
-  
-  let documents = [];
-  
   try {
-      const response = UrlFetchApp.fetch(url, {
-        method: 'post',
-        headers: {
-          Authorization: `Bearer ${token}`
-        },
-        contentType: 'application/json',
-        payload: JSON.stringify(queryPayload),
-        muteHttpExceptions: true
-      });
-      
-      if (response.getResponseCode() !== 200) {
-        console.error('Firestore runQuery failed', response.getContentText());
-        return [];
-      }
-      
-      const json = JSON.parse(response.getContentText());
-      // json is array of results. Each result has 'document'
-      if (Array.isArray(json)) {
-          json.forEach(item => {
-             if (item.document) {
-                 documents.push(item.document);
-             }
-          });
-      }
+     const response = UrlFetchApp.fetch(url, {
+       method: 'post',
+       headers: { Authorization: `Bearer ${token}` },
+       contentType: 'application/json',
+       payload: JSON.stringify(payload),
+       muteHttpExceptions: true
+     });
+     
+     if (response.getResponseCode() !== 200) return [];
+     
+     const json = JSON.parse(response.getContentText());
+     // json is [{document: ...}]
+     if (!Array.isArray(json)) return [];
+     
+     return json.map(item => item.document ? parseFirestoreMap_(item.document.fields) : null).filter(Boolean);
   } catch (e) {
-      console.error('getCarEventsFromFirestore error:', e);
-      return [];
+     console.error('queryVehiclesByStatus error:', e);
+     return [];
   }
-  
-  // Parse documents
-  return documents.map(doc => {
-    return parseFirestoreMap_(doc.fields);
-  });
 }
 
 function parseFirestoreValue_(valueObj) {
@@ -518,5 +620,113 @@ function parseFirestoreMap_(fields) {
         obj[key] = parseFirestoreValue_(fields[key]);
     }
     return obj;
+}
+
+/**
+ * Change the responsible beneficiary for a vehicle.
+ * Rules:
+ * 1. Downgrade any current 'Responsible' to 'Beneficiary'.
+ * 2. Promote 'newRespName' to 'Responsible'.
+ * 3. If 'newRespName' is not in crew, add them.
+ */
+function changeResponsibleBeneficiaryInFirestore(vehicleNumber, newRespName) {
+  const docData = getVehicleDocument(vehicleNumber);
+  if (!docData) throw new Error(`Vehicle ${vehicleNumber} not found.`);
+  
+  if (docData.status !== 'IN_USE' || !docData.currentAssignment) {
+     throw new Error(`Vehicle ${vehicleNumber} is not IN_USE.`);
+  }
+
+  const activeCrew = docData.currentAssignment.activeCrew || [];
+  let found = false;
+
+  // Downgrade existing and Promote new
+  activeCrew.forEach(member => {
+     if (member.role === 'Responsible') {
+        member.role = 'Beneficiary';
+     }
+     if (member.name === newRespName) {
+        member.role = 'Responsible';
+        found = true;
+     }
+  });
+
+  // If not found, add
+  if (!found) {
+     activeCrew.push({
+        name: newRespName,
+        role: 'Responsible',
+        joinedAt: new Date().toISOString()
+     });
+  }
+
+  docData.currentAssignment.activeCrew = activeCrew;
+
+  // Write back
+  const projectId = getFirestoreProjectId_();
+  const databaseRoot = `projects/${projectId}/databases/(default)/documents`;
+  const safeId = String(vehicleNumber).replace(/\//g, '_').trim();
+  const docPath = `cart_plan/${safeId}`;
+
+  const fields = firestoreFields_(docData);
+  const write = {
+    update: {
+      name: `${databaseRoot}/${docPath}`,
+      fields: fields
+    }
+  };
+  
+  return executeFirestoreBatch([write]);
+}
+
+/**
+ * Register a new vehicle in Firestore with status AVAILABLE (or RELEASE).
+ */
+function registerNewVehicleInFirestore(vehicleNumber, metadata, entryData) {
+  const projectId = getFirestoreProjectId_();
+  const databaseRoot = `projects/${projectId}/databases/(default)/documents`;
+  const safeId = String(vehicleNumber).replace(/\//g, '_').trim();
+  const docPath = `cart_plan/${safeId}`;
+
+  const nowStr = new Date().toISOString();
+
+  // Construct Base Doc
+  const docData = {
+    vehicleNumber: vehicleNumber,
+    status: 'AVAILABLE', // Default to available
+    make: metadata.make || '',
+    model: metadata.model || '',
+    category: metadata.category || '',
+    owner: metadata.owner || '',
+    usageType: metadata.usageType || '',
+    currentAssignment: null,
+    recentHistory: []
+  };
+
+  // Add initial history entry for creation/release
+  const historyEntry = {
+    action: 'NEW_REGISTRATION',
+    date: nowStr,
+    project: entryData.project || '',
+    team: entryData.team || '',
+    remarks: entryData.remarks || '',
+    submitter: entryData.submitter || ''
+  };
+  docData.recentHistory.push(historyEntry);
+
+  const fields = firestoreFields_(docData);
+  const write = {
+    update: { // Use update with upsert semantics (in this lib, update creates if missing often, or check?)
+              // Actually executeFirestoreBatch 'update' usually requires existence?
+              // Standard behavior: 'update' performs PATCH. 'transform' can operate.
+              // To be safe, if we want to Create or Overwrite, usually we use 'currentDocument' constraints.
+              // But here, let's assume we want to SET.
+              // The library I'm using here seems to use "update" key for Writes.
+      name: `${databaseRoot}/${docPath}`,
+      fields: fields
+    }
+  };
+  
+  return executeFirestoreBatch([write]);
 }
 

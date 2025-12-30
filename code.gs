@@ -4913,47 +4913,32 @@ function submitCarRelease(releaseData) {
       rowsToInsert.push(rowValues.slice());
     }
 
-    // [NEW] Persist Release Events to Firestore 'cartp_plan'
-    // [NEW] Persist Release Events to Firestore 'cartp_plan' (Hierarchical)
-    try {
-       const lineItems = rowsToInsert.map(row => {
-          return {
-              ref: idxRefCol >= 0 ? row[idxRefCol] : '',
-              timestamp: idxRespTimeCol >= 0 ? row[idxRespTimeCol] : (releaseData.timestamp instanceof Date ? releaseData.timestamp : new Date()),
-              // idxTeamCol is 'Team'. idxVehicleCol is 'Vehicle Number'.
-              team: idxTeamCol >= 0 ? row[idxTeamCol] : '',
-              
-              beneficiary: idxRBCol >= 0 ? row[idxRBCol] : '',
-              
-              // Explicitly capture all aliases requested
-              responsibleBeneficiary: idxRBCol >= 0 ? row[idxRBCol] : '', // Usually same as Beneficiary in Release context, or check for specific Full col
-              rBen: idxRBenShortCol >= 0 ? row[idxRBenShortCol] : '',
-              rBenTime: idxRespTimeCol >= 0 ? row[idxRespTimeCol] : null,
-              
-              previousReleaseFlag: idxPrevFlagCol >= 0 ? row[idxPrevFlagCol] : '',
-              
-              vehicleNumber: idxVehicleCol >= 0 ? row[idxVehicleCol] : '',
-              status: idxStatusCol >= 0 ? row[idxStatusCol] : 'RELEASE',
-              remarks: idxRemarksCol >= 0 ? row[idxRemarksCol] : '',
-              rating: idxStarsCol >= 0 ? row[idxStarsCol] : '',
-              submitter: idxSubmitCol >= 0 ? row[idxSubmitCol] : '',
-              action: 'RELEASE'
-          };
-       });
+     // [NEW] Persist Release to Firestore 'cart_plan' (Single Doc / Last Man Standing)
+     try {
+       // Extract names to remove from the defined column
+       const crewNamesToRemove = rowsToInsert.map(row => {
+          return idxRBCol >= 0 ? row[idxRBCol] : '';
+       }).filter(n => !!n);
 
-       persistCarTransactionToFirestore({
-          type: 'RELEASE',
+       const relVehicle = (rowsToInsert.length && idxVehicleCol >= 0) ? rowsToInsert[0][idxVehicleCol] : (releaseData.vehicle || '');
+
+       const releaseDetails = {
           timestamp: new Date(),
-          submitter: submitter || '',
-          project: '', 
-          team: '',    
-          rows: lineItems
-       });
+          remarks: idxRemarksCol >= 0 ? rowsToInsert[0][idxRemarksCol] : '',
+          rating: idxStarsCol >= 0 ? rowsToInsert[0][idxStarsCol] : 0,
+          vehicle: relVehicle
+       };
+       
+       if (crewNamesToRemove.length && relVehicle) {
+          updateVehicleAsLastManStanding(relVehicle, crewNamesToRemove, releaseDetails);
+          console.log('[RELEASE_CAR] ✅ Vehicle status updated in Firestore cart_plan (Single Doc)');
+       } else {
+          console.warn('[RELEASE_CAR] Could not identify crew or vehicle to release.', {crew: crewNamesToRemove, vehicle: relVehicle});
+       }
 
-       console.log('[RELEASE_CAR] ✅ Data successfully written to Firestore cartp_plan (Hierarchical)');
-    } catch (fsErr) {
-       console.error('[RELEASE_CAR] ❌ Firestore write failed:', fsErr);
-    }
+     } catch (fsErr) {
+        console.error('[RELEASE_CAR] ❌ Firestore write failed:', fsErr);
+     }
 
     // [DISABLED] Update existing rows in Sheet
     //   for (let i = 0; i < updates.length; i++) {
@@ -5292,231 +5277,27 @@ function releaseCarUser(payload) {
 function changeVehicleResponsibleBeneficiary(carNumber, beneficiaryName, options) {
   try {
     const targetCarRaw = String(carNumber || '').trim();
-    const targetCar = _vehicleKey_(targetCarRaw);
     const candidateName = _sanitizeResponsibleName(beneficiaryName) || String(beneficiaryName || '').trim();
 
-    if (!targetCar) {
-      return { ok: false, error: 'Vehicle number required' };
-    }
-    if (!candidateName) {
-      return { ok: false, error: 'Beneficiary name required' };
-    }
+    if (!targetCarRaw) return { ok: false, error: 'Vehicle number required' };
+    if (!candidateName) return { ok: false, error: 'Beneficiary name required' };
 
-    const sh = _openCarTP_();
-    if (!sh) {
-      return { ok: false, error: 'CarT_P sheet not found' };
-    }
-
-    const lastRow = sh.getLastRow();
-    const lastCol = sh.getLastColumn();
-    if (lastRow <= 1 || lastCol <= 0) {
-      return { ok: false, error: 'CarT_P sheet has no data' };
-    }
-
-    const header = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
-    const IX = _headerIndex_(header);
-    function idx(labels, required) {
-      try {
-        return IX.get(labels);
-      } catch (err) {
-        if (required) throw err;
-        return -1;
-      }
-    }
-
-    const iRef   = idx(['Reference Number', 'Ref', 'Ref Number'], false);
-    const iDate  = idx(['Date and time of entry', 'Date and time', 'Timestamp', 'Date'], false);
-    const iProj  = idx(['Project'], false);
-    const iTeam  = idx(['Team', 'Team Name'], false);
-    const iCar   = idx(['Vehicle Number', 'Car Number', 'Vehicle No', 'Car No', 'Car #', 'Car'], true);
-    const iMake  = idx(['Make', 'Car Make', 'Brand'], false);
-    const iModel = idx(['Model', 'Car Model'], false);
-    const iCat   = idx(['Category', 'Vehicle Category', 'Cat'], false);
-    const iUse   = idx(['Usage Type', 'Usage', 'Use Type'], false);
-    const iOwner = idx(['Owner', 'Owner Name', 'Owner Info'], false);
-    const iResp  = idx(['R.Beneficiary', 'Responsible Beneficiary', 'R Beneficiary', 'Responsible', 'R. Ben', 'R Ben'], false);
-    const iRespShort = idx(['R. Ben', 'R Ben'], false);
-    const iRespFull  = idx(['Responsible Beneficiary', 'Name of Responsible beneficiary'], false);
-    const iStatus    = idx(['Status', 'In Use/Release', 'In Use / release', 'In Use'], false);
-    const iRemarks   = idx(['Last Users remarks', 'Remarks', 'Feedback'], false);
-    const iRatings   = idx(['Ratings', 'Stars', 'Rating'], false);
-    const iSubmit    = idx(['Submitter username', 'Submitter', 'User'], false);
-    const iRespTime  = idx(['R.Ben Time', 'R.Ben timestamp', 'Responsible Beneficiary Time'], false);
-
-    const dataRange = sh.getRange(2, 1, lastRow - 1, lastCol);
-    const values = dataRange.getValues();
-    const display = dataRange.getDisplayValues();
-
-    let latestInUseRow = null;
-    let latestInUseDisplay = null;
-    let latestInUseTs = -1;
-    let latestInUseIndex = -1;
-    let latestAnyRow = null;
-    let latestAnyDisplay = null;
-    let latestAnyTs = -1;
-    let latestAnyIndex = -1;
-
-    const beneficiaryMap = new Map();
-
-    for (let r = 0; r < values.length; r++) {
-      const row = values[r];
-      const dispRow = display[r];
-
-      const rawCar = row[iCar] != null && row[iCar] !== '' ? row[iCar] : dispRow[iCar];
-      const rowKey = _vehicleKey_(rawCar);
-      if (!rowKey || rowKey !== targetCar) continue;
-
-      const ts = _parseTs_(row[iDate] != null && row[iDate] !== '' ? row[iDate] : dispRow[iDate]);
-      if (ts >= latestAnyTs) {
-        latestAnyTs = ts;
-        latestAnyRow = row.slice();
-        latestAnyDisplay = dispRow.slice();
-        latestAnyIndex = r;
-      }
-
-      const status = _normStatus_(row[iStatus] != null && row[iStatus] !== '' ? row[iStatus] : dispRow[iStatus]);
-      if (status === 'IN USE') {
-        if (ts >= latestInUseTs) {
-          latestInUseTs = ts;
-          latestInUseRow = row.slice();
-          latestInUseDisplay = dispRow.slice();
-          latestInUseIndex = r;
-        }
-      }
-
-      const names = _splitBeneficiaryNames_(row[iResp] != null && row[iResp] !== '' ? row[iResp] : dispRow[iResp]);
-      names.forEach((name) => {
-        const normalized = _beneficiaryKey_(name);
-        if (!normalized) return;
-        const existing = beneficiaryMap.get(normalized);
-        if (!existing || ts >= existing.ts) {
-          beneficiaryMap.set(normalized, {
-            name: _sanitizeResponsibleName(name) || name,
-            status: status || '',
-            ts: ts || 0
-          });
-        }
-      });
-    }
-
-    if (!latestInUseRow) {
-      // No IN USE entry exists, fall back to latest row but still enforce validation
-      latestInUseRow = latestAnyRow ? latestAnyRow.slice() : null;
-      latestInUseDisplay = latestAnyDisplay ? latestAnyDisplay.slice() : null;
-      latestInUseTs = latestAnyTs;
-      latestInUseIndex = latestAnyIndex;
-    }
-
-    if (!latestInUseRow) {
-      return { ok: false, error: 'No matching vehicle entries found.' };
-    }
-
-    const normalizedCandidate = _beneficiaryKey_(candidateName);
-    const candidateEntry = beneficiaryMap.get(normalizedCandidate);
-    if (!candidateEntry || candidateEntry.status !== 'IN USE') {
-      return { ok: false, error: `${candidateName} is not currently marked as IN USE for this vehicle.` };
-    }
-
-    const currentNames = _splitBeneficiaryNames_(latestInUseRow[iResp] != null && latestInUseRow[iResp] !== '' ? latestInUseRow[iResp] : latestInUseDisplay[iResp]);
-    const currentResponsible = currentNames.length ? currentNames[0] : '';
-    if (currentResponsible && _beneficiaryKey_(currentResponsible) === normalizedCandidate) {
-      return {
-        ok: true,
-        unchanged: true,
-        previousResponsible: currentResponsible,
-        newResponsible: candidateEntry.name,
-        carDetails: getCarReleaseDetails(targetCarRaw)
-      };
-    }
-
-    const baseRow = latestInUseRow ? latestInUseRow.slice() : new Array(lastCol).fill('');
-    const now = new Date();
-    const nowIso = now instanceof Date ? now : new Date(now);
-    const sanitizedCandidate = _sanitizeResponsibleName(candidateEntry.name) || candidateEntry.name || candidateName;
-
-    function setValue(index, value) {
-      if (index >= 0 && index < baseRow.length) {
-        baseRow[index] = value;
-      }
-    }
-
-    setValue(iDate, now);
-    setValue(iStatus, 'IN USE');
-    setValue(iResp, sanitizedCandidate);
-    setValue(iRespShort, sanitizedCandidate);
-    setValue(iRespFull, sanitizedCandidate);
-    setValue(iRespTime, now);
-    setValue(iSubmit, (function(){
-      try {
-        const email = Session.getActiveUser().getEmail();
-        return email || 'System';
-      } catch (_e) {
-        return 'System';
-      }
-    })());
-    setValue(iRatings, 0);
-    setValue(iRemarks, '');
-
-    if (iRef >= 0) {
-      const ref = `RESP-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-      setValue(iRef, ref);
-    }
-
-    const ensureField = (index, fallback) => {
-      if (index < 0) return;
-      if (baseRow[index] == null || baseRow[index] === '') {
-        setValue(index, fallback);
-      }
-    };
-
-    const fallbackRow = latestAnyRow || latestInUseRow;
-    if (fallbackRow) {
-      ensureField(iProj, fallbackRow[iProj]);
-      ensureField(iTeam, fallbackRow[iTeam]);
-      ensureField(iMake, fallbackRow[iMake]);
-      ensureField(iModel, fallbackRow[iModel]);
-      ensureField(iCat, fallbackRow[iCat]);
-      ensureField(iUse, fallbackRow[iUse]);
-      ensureField(iOwner, fallbackRow[iOwner]);
-      ensureField(iCar, fallbackRow[iCar]);
-    }
-
-    sh.getRange(lastRow + 1, 1, 1, lastCol).setValues([baseRow]);
-
-    try {
-      invalidateVehicleInUseCache();
-      invalidateVehicleReleasedCache('Responsible beneficiary updated');
-    } catch (_cacheErr) {
-      // swallow cache errors
-    }
-
-    try {
-      refreshVehicleStatusSheets();
-    } catch (refreshErr) {
-      console.warn('refreshVehicleStatusSheets failed after responsible change:', refreshErr);
-    }
-
-    try {
-      syncVehicleSheetFromCarTP();
-    } catch (syncErr) {
-      console.warn('syncVehicleSheetFromCarTP failed after responsible change:', syncErr);
-    }
+    // [NEW] Firestore Single-Doc Logic
+    console.log('[CHANGE_RESPONSIBLE] Calling Firestore helper for:', targetCarRaw, candidateName);
+    changeResponsibleBeneficiaryInFirestore(targetCarRaw, candidateName);
     
-    // [FIREBASE HOOK] Sync CarT_P Update
-    try {
-      persistRowToFirestore('cartp_plan', 'Ref', baseRow, header);
-    } catch (fsErr) {
-      console.warn('Firestore sync failed for CarT_P (changeVehicleResponsibleBeneficiary)', fsErr);
-    }
-
-    const updatedDetails = getCarReleaseDetails(targetCarRaw);
+    // [DISABLED] Sheet Write Operations
+    /*
+    const sh = _openCarTP_();
+    ... legacy sheet logic ...
+    persistRowToFirestore(...)
+    */
 
     return {
       ok: true,
-      previousResponsible: currentResponsible || '',
-      newResponsible: sanitizedCandidate,
+      newResponsible: candidateName,
       carNumber: targetCarRaw,
-      carDetails: updatedDetails
+      carDetails: getCarReleaseDetails(targetCarRaw) // Fetch updated details
     };
   } catch (error) {
     console.error('changeVehicleResponsibleBeneficiary error:', error);
@@ -5527,188 +5308,40 @@ function changeVehicleResponsibleBeneficiary(carNumber, beneficiaryName, options
 function addVehicleSecondaryBeneficiary(carNumber, beneficiaryName, options) {
   try {
     const targetCarRaw = String(carNumber || '').trim();
-    const targetCar = _vehicleKey_(targetCarRaw);
     const rawCandidate = String(beneficiaryName || '').trim();
     const candidateName = _sanitizeResponsibleName(rawCandidate) || rawCandidate;
 
-    if (!targetCar) {
-      return { ok: false, error: 'Vehicle number required' };
-    }
-    if (!candidateName) {
-      return { ok: false, error: 'Beneficiary name required' };
-    }
+    if (!targetCarRaw) return { ok: false, error: 'Vehicle number required' };
+    if (!candidateName) return { ok: false, error: 'Beneficiary name required' };
 
-    const sh = _openCarTP_();
-    if (!sh) return { ok: false, error: 'CarT_P sheet not found' };
-
-    const lastRow = sh.getLastRow();
-    const lastCol = sh.getLastColumn();
-    if (lastRow <= 1 || lastCol <= 0) {
-      return { ok: false, error: 'CarT_P sheet has no data' };
+    // [NEW] Firestore Single-Doc Logic
+    const currentDoc = getVehicleDocument(targetCarRaw);
+    if (!currentDoc || currentDoc.status !== 'IN_USE') {
+      return { ok: false, error: 'Vehicle not IN_USE' };
     }
 
-    const header = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
-    const IX = _headerIndex_(header);
-    function idx(labels, required) {
-      try {
-        return IX.get(labels);
-      } catch (err) {
-        if (required) throw err;
-        return -1;
-      }
-    }
-
-    const iRef   = idx(['Reference Number', 'Ref', 'Ref Number'], false);
-    const iDate  = idx(['Date and time of entry', 'Date and time', 'Timestamp', 'Date'], false);
-    const iProj  = idx(['Project'], false);
-    const iTeam  = idx(['Team', 'Team Name'], false);
-    const iCar   = idx(['Vehicle Number', 'Car Number', 'Vehicle No', 'Car No', 'Car #', 'Car'], true);
-    const iMake  = idx(['Make', 'Car Make', 'Brand'], false);
-    const iModel = idx(['Model', 'Car Model'], false);
-    const iCat   = idx(['Category', 'Vehicle Category', 'Cat'], false);
-    const iUse   = idx(['Usage Type', 'Usage', 'Use Type'], false);
-    const iOwner = idx(['Owner', 'Owner Name', 'Owner Info'], false);
-    const iResp  = idx(['R.Beneficiary', 'Responsible Beneficiary', 'R Beneficiary', 'Responsible', 'R. Ben', 'R Ben'], false);
-    const iRespShort = idx(['R. Ben', 'R Ben'], false);
-    const iRespFull  = idx(['Responsible Beneficiary', 'Name of Responsible beneficiary'], false);
-    const iStatus    = idx(['Status', 'In Use/Release', 'In Use / release', 'In Use'], false);
-    const iRemarks   = idx(['Last Users remarks', 'Remarks', 'Feedback'], false);
-    const iRatings   = idx(['Ratings', 'Stars', 'Rating'], false);
-    const iSubmit    = idx(['Submitter username', 'Submitter', 'User'], false);
-    const iRespTime  = idx(['R.Ben Time', 'R.Ben timestamp', 'Responsible Beneficiary Time'], false);
-
-    const dataRange = sh.getRange(2, 1, lastRow - 1, lastCol);
-    const values = dataRange.getValues();
-    const display = dataRange.getDisplayValues();
-
-    let latestInUseRow = null;
-    let latestInUseDisplay = null;
-    let latestInUseTs = -1;
-    let latestAnyRow = null;
-    let latestAnyDisplay = null;
-    let latestAnyTs = -1;
-
-    const beneficiaryMap = new Map();
-
-    for (let r = 0; r < values.length; r++) {
-      const row = values[r];
-      const dispRow = display[r];
-      const rawCar = row[iCar] != null && row[iCar] !== '' ? row[iCar] : dispRow[iCar];
-      const rowKey = _vehicleKey_(rawCar);
-      if (!rowKey || rowKey !== targetCar) continue;
-
-      const ts = _parseTs_(row[iDate] != null && row[iDate] !== '' ? row[iDate] : dispRow[iDate]);
-      if (ts >= latestAnyTs) {
-        latestAnyTs = ts;
-        latestAnyRow = row.slice();
-        latestAnyDisplay = dispRow.slice();
-      }
-      const status = _normStatus_(row[iStatus] != null && row[iStatus] !== '' ? row[iStatus] : dispRow[iStatus]);
-      if (status === 'IN USE' && ts >= latestInUseTs) {
-        latestInUseTs = ts;
-        latestInUseRow = row.slice();
-        latestInUseDisplay = dispRow.slice();
-      }
-
-      const names = _splitBeneficiaryNames_(row[iResp] != null && row[iResp] !== '' ? row[iResp] : dispRow[iResp]);
-      names.forEach((name) => {
-        const normalized = _beneficiaryKey_(name);
-        if (!normalized) return;
-        const existing = beneficiaryMap.get(normalized);
-        if (!existing || ts >= existing.ts) {
-          beneficiaryMap.set(normalized, { name, status: status || '', ts: ts || 0 });
-        }
-      });
-    }
-
-    const normalizedCandidate = _beneficiaryKey_(candidateName);
-    const existingEntry = beneficiaryMap.get(normalizedCandidate);
-    if (existingEntry && existingEntry.status === 'IN USE') {
-      return { ok: false, error: `${candidateName} is already marked as IN USE for this vehicle.` };
-    }
-
-    if (!latestInUseRow) {
-      latestInUseRow = latestAnyRow ? latestAnyRow.slice() : null;
-      latestInUseDisplay = latestAnyDisplay ? latestAnyDisplay.slice() : null;
-    }
-    if (!latestInUseRow) {
-      return { ok: false, error: 'No baseline IN USE entry found for this vehicle.' };
-    }
-
-    const currentResponsible =
-      _sanitizeResponsibleName(
-        (iRespShort >= 0 ? latestInUseRow[iRespShort] : '') ||
-        (iRespFull >= 0 ? latestInUseRow[iRespFull] : '')
-      ) ||
-      _sanitizeResponsibleName(
-        (iRespShort >= 0 && latestInUseDisplay ? latestInUseDisplay[iRespShort] : '') ||
-        (iRespFull >= 0 && latestInUseDisplay ? latestInUseDisplay[iRespFull] : '')
-      );
-
-    const baseRow = latestInUseRow.slice();
-    const now = new Date();
-    const responsibleDisplay = currentResponsible || candidateName;
-    const existingRespTime = iRespTime >= 0
-      ? (latestInUseRow[iRespTime] || (latestInUseDisplay ? latestInUseDisplay[iRespTime] : ''))
-      : '';
-
-    if (iResp >= 0) baseRow[iResp] = candidateName;
-    if (iRespShort >= 0) baseRow[iRespShort] = responsibleDisplay;
-    if (iRespFull >= 0) baseRow[iRespFull] = responsibleDisplay;
-    if (iDate >= 0) baseRow[iDate] = now;
-    if (iStatus >= 0) baseRow[iStatus] = 'IN USE';
-    if (iRemarks >= 0) baseRow[iRemarks] = '';
-    if (iRatings >= 0) baseRow[iRatings] = 0;
-    if (iRespTime >= 0) baseRow[iRespTime] = existingRespTime || now;
-    if (iSubmit >= 0) {
-      try {
-        baseRow[iSubmit] = Session.getActiveUser().getEmail() || 'System';
-      } catch (_e) {
-        baseRow[iSubmit] = 'System';
-      }
-    }
-    if (iRef >= 0) {
-      baseRow[iRef] = `SEC-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-    }
-
-    const fallbackRow = latestAnyRow || latestInUseRow;
-    const ensureField = (index, fallback) => {
-      if (index < 0) return;
-      if (baseRow[index] == null || baseRow[index] === '') {
-        baseRow[index] = fallback;
-      }
-    };
-    if (fallbackRow) {
-      ensureField(iProj, fallbackRow[iProj]);
-      ensureField(iTeam, fallbackRow[iTeam]);
-      ensureField(iMake, fallbackRow[iMake]);
-      ensureField(iModel, fallbackRow[iModel]);
-      ensureField(iCat, fallbackRow[iCat]);
-      ensureField(iUse, fallbackRow[iUse]);
-      ensureField(iOwner, fallbackRow[iOwner]);
-      ensureField(iCar, fallbackRow[iCar]);
-    }
-
-    sh.getRange(lastRow + 1, 1, 1, lastCol).setValues([baseRow]);
-
-    try { invalidateVehicleInUseCache(); } catch (_e) {}
-    try { invalidateVehicleReleasedCache('Vehicle beneficiary added'); } catch (_e) {}
-    try { refreshVehicleStatusSheets(); } catch (refreshErr) { console.warn('refreshVehicleStatusSheets failed after secondary beneficiary add:', refreshErr); }
-    try { syncVehicleSheetFromCarTP(); } catch (syncErr) { console.warn('syncVehicleSheetFromCarTP failed after secondary beneficiary add:', syncErr); }
+    // Reuse assignCrewToVehicle to append
+    const newCrew = [{
+      name: candidateName,
+      role: 'Beneficiary',
+      joinedAt: new Date().toISOString()
+    }];
     
-    // [FIREBASE HOOK] Sync CarT_P Update
-    try {
-      persistRowToFirestore('cartp_plan', 'Ref', baseRow, header);
-    } catch (fsErr) {
-      console.warn('Firestore sync failed for CarT_P (addVehicleSecondaryBeneficiary)', fsErr);
-    }
+    console.log('[ADD_SECONDARY] Calling assignCrewToVehicle for:', targetCarRaw, candidateName);
+    assignCrewToVehicle(targetCarRaw, null, newCrew);
 
-    const updatedDetails = getCarReleaseDetails(targetCarRaw);
+    // [DISABLED] Sheet Write Operations
+    /*
+    const sh = _openCarTP_();
+    ... legacy sheet logic ...
+    persistRowToFirestore(...)
+    */
+
     return {
       ok: true,
       newBeneficiary: candidateName,
       carNumber: targetCarRaw,
-      carDetails: updatedDetails
+      carDetails: getCarReleaseDetails(targetCarRaw)
     };
   } catch (error) {
     console.error('addVehicleSecondaryBeneficiary error:', error);
@@ -5976,29 +5609,42 @@ function getUniqueReleaseCars() {
 /**
  * Return unique vehicles where the latest entry by Date/Time (column like 'Date and time of entry')
  * has Status = RELEASE. Ignores older entries regardless of their statuses.
+ * [NEW] Sources directly from Firestore.
  */
 function getLatestReleaseCars() {
   try {
-    const cartpVehicles = _collectLatestReleaseCarsFromCarTP_();
-    if (cartpVehicles.length) {
-      console.log(`getLatestReleaseCars -> ${cartpVehicles.length} vehicles sourced from CarT_P summary`);
-      return cartpVehicles;
-    }
+    console.log('[RELEASE_CATALOG] Fetching AVAILABLE vehicles from Firestore...');
+    // Limit increased to 100 to show a good catalog, can be paginated later if needed
+    const docs = queryVehiclesByStatus('AVAILABLE', 100); 
+    
+    // Map Firestore docs to Frontend-compatible format
+    const results = docs.map(doc => {
+      // Find latest relevant timestamp
+      let latestDate = '';
+      if (Array.isArray(doc.recentHistory) && doc.recentHistory.length > 0) {
+        const last = doc.recentHistory[doc.recentHistory.length - 1];
+        latestDate = last.date || '';
+      }
+      
+      return {
+        vehicleNumber: doc.vehicleNumber, // Frontend also supports carNumber alias
+        carNumber: doc.vehicleNumber,
+        make: doc.make || '',
+        model: doc.model || '',
+        category: doc.category || '',
+        usageType: doc.usageType || '',
+        owner: doc.owner || '',
+        status: doc.status || 'RELEASE', // Frontend expects 'RELEASE' or 'AVAILABLE'
+        latestRelease: latestDate,     // Timestamp string
+        source: 'Firestore'
+      };
+    });
 
-    console.warn('getLatestReleaseCars: CarT_P summary returned no release rows. Falling back to Vehicle_Released summary.');
-    const fallback = _collectLatestReleaseCarsFromVehicleReleased_();
-    console.log(`getLatestReleaseCars -> ${fallback.length} vehicles sourced from Vehicle_Released summary (fallback)`);
-    return fallback;
+    console.log(`[RELEASE_CATALOG] Found ${results.length} available vehicles.`);
+    return results;
   } catch (e) {
     console.error('getLatestReleaseCars error:', e);
-    try {
-      const fallback = _collectLatestReleaseCarsFromVehicleReleased_();
-      console.log(`getLatestReleaseCars -> ${fallback.length} vehicles sourced from Vehicle_Released summary (error fallback)`);
-      return fallback;
-    } catch (fallbackErr) {
-      console.error('getLatestReleaseCars fallback error:', fallbackErr);
-      return [];
-    }
+    return [];
   }
 }
 
@@ -7418,7 +7064,13 @@ function _ensureCarTPSchemaAndHeader_(sh){
 function assignCarToTeam(payload){
   try{
     console.log('[ASSIGN_CAR] Function called with payload:', JSON.stringify(payload, null, 2));
-    
+    console.error("DEBUG: HEAD VERSION RUNNING - WRITES DISABLED");
+
+    // DEBUG: Payload Dump
+    console.log('[ASSIGN_CAR] Payload Keys:', Object.keys(payload));
+    if (payload.car) console.log('[ASSIGN_CAR] payload.car:', JSON.stringify(payload.car));
+    console.log('[ASSIGN_CAR] payload.carNumber:', payload.carNumber);
+
     if(!payload) {
       console.error('[ASSIGN_CAR] No payload provided');
       return { ok:false, error:'No payload' };
@@ -7447,9 +7099,9 @@ function assignCarToTeam(payload){
       return { ok:false, error:'Missing project/team/carNumber' };
     }
 
-    console.log('[ASSIGN_CAR] Opening CarT_P sheet...');
-    const sh = _openCarTP_();
-    if(!sh) {
+    console.log('[ASSIGN_CAR] Opening CarT_P sheet... (DISABLED)');
+    const sh_disabled = _openCarTP_();
+    if(!sh_disabled) {
       console.error('[ASSIGN_CAR] CarT_P sheet not found');
       return { ok:false, error:'CarT_P sheet not found' };
     }
@@ -7602,48 +7254,42 @@ function assignCarToTeam(payload){
       
       console.log('[ASSIGN_CAR] Data prepared (writing to Firestore instead of Sheet):', rows.length);
       
-      // [NEW] Persist to Firestore 'cartp_plan' (Hierarchical)
+      // [NEW] Persist to Firestore 'cart_plan' (Single Doc Model)
       try {
-        const lineItems = rows.map(row => {
-          return {
-              ref: iRef >= 0 ? row[iRef] : '',
-              timestamp: iDate >= 0 ? row[iDate] : new Date(),
-              project: iProj >= 0 ? row[iProj] : '',
-              team: iTeam >= 0 ? row[iTeam] : '',
-              
-              beneficiary: iResp >= 0 ? row[iResp] : '', // "R.Beneficiary" column usually
-              
-              // Explicitly capture all aliases requested
-              responsibleBeneficiary: iRespFull >= 0 ? row[iRespFull] : (iResp >= 0 ? row[iResp] : ''),
-              rBen: iRespShort >= 0 ? row[iRespShort] : '',
-              rBenTime: iRespTime >= 0 ? row[iRespTime] : null,
-              
-              previousReleaseFlag: iPrevFlag >= 0 ? row[iPrevFlag] : '',
-
-              vehicleNumber: iCarNo >= 0 ? row[iCarNo] : '',
-              make: iMake >= 0 ? row[iMake] : '',
-              model: iModel >= 0 ? row[iModel] : '',
-              category: iCat >= 0 ? row[iCat] : '',
-              usageType: iUse >= 0 ? row[iUse] : '',
-              owner: iOwner >= 0 ? row[iOwner] : '',
-              status: iStat >= 0 ? row[iStat] : 'IN USE',
-              remarks: iRem >= 0 ? row[iRem] : '',
-              rating: iRate >= 0 ? row[iRate] : '',
-              submitter: iSub >= 0 ? row[iSub] : '',
-              action: 'ASSIGN'
-          };
+        // Construct Crew List
+        const newCrew = targetBeneficiaries.map(name => {
+           const isResp = responsible && _norm(name).toLowerCase() === responsibleKey;
+           return {
+              name: name,
+              role: isResp ? 'Responsible' : 'Beneficiary',
+              joinedAt: new Date().toISOString()
+           };
         });
 
-        persistCarTransactionToFirestore({
-            type: 'ASSIGN',
-            timestamp: new Date(),
-            submitter: submitter,
-            project: project,
-            team: team,
-            rows: lineItems
-        });
+        // Construct Assignment Data (Common for the trip)
+        // Taking ref from first row or generating
+        const refVal = (iRef >= 0 && rows.length > 0) ? rows[0][iRef] : `REF-${Date.now()}`;
         
-        console.log('[ASSIGN_CAR] ✅ Data successfully written to Firestore cartp_plan (Hierarchical)');
+        const assignmentData = {
+           ref: refVal,
+           project: project,
+           team: team,
+           submitter: submitter
+        };
+
+        // Construct Vehicle Metadata for New Cars
+        const vMeta = {
+            make: make,
+            model: model,
+            category: cat,
+            owner: owner,
+            usageType: use
+        };
+
+        // Call Firestore Helper
+        assignCrewToVehicle(carNum, assignmentData, newCrew, vMeta);
+        
+        console.log('[ASSIGN_CAR] ✅ Data successfully written to Firestore cart_plan (Single Doc)');
       } catch (fsErr) {
         console.error('[ASSIGN_CAR] ❌ Firestore write failed:', fsErr);
       }
@@ -7654,6 +7300,7 @@ function assignCarToTeam(payload){
       // console.log('[ASSIGN_CAR] ✅ Data successfully written to CarT_P sheet');
       // console.log('[ASSIGN_CAR] New last row after write:', sh.getLastRow());
 
+      /* [DISABLED] Legacy Sheet Updates (Vehicle_InUse)
       try {
         rows.forEach(function(rowValues){
           const summaryObj = {};
@@ -7666,6 +7313,7 @@ function assignCarToTeam(payload){
       } catch (summaryErr) {
         console.warn('[ASSIGN_CAR] Vehicle_InUse summary update failed:', summaryErr);
       }
+      */
     } else {
       console.warn('[ASSIGN_CAR] No rows to write - this should not happen');
     }
@@ -7906,22 +7554,37 @@ function submitNewVehicleRelease(payload){
     }
     const vehicleNumber = vehicleNumberInput.toUpperCase();
 
+    // Validate required metadata
     const make = _norm(payload.make);
     const model = _norm(payload.model);
     const category = _norm(payload.category);
-    const usageType = _norm(payload.usageType);
     const owner = _norm(payload.owner);
-    const project = _norm(payload.project);
-    const team = _norm(payload.team);
-    const responsibleBeneficiary = _norm(payload.responsibleBeneficiary);
 
-    const duplicateCheck = _vehicleNumberExists_(vehicleNumber);
-    if (duplicateCheck.exists) {
-      const origin = duplicateCheck.source ? ` (${duplicateCheck.source})` : '';
-      const addedByNote = duplicateCheck.addedBy ? ` — added by ${duplicateCheck.addedBy}` : '';
-      return { ok: false, error: `Vehicle number ${vehicleNumber} already exists${origin}${addedByNote}` };
+    if (!make || !model) {
+       return { ok: false, error: 'Make and Model required' };
     }
 
+    // [NEW] Firestore Single-Doc Logic
+    const metadata = {
+       make: make,
+       model: model,
+       category: category,
+       owner: owner,
+       usageType: _norm(payload.usageType)
+    };
+
+    const entryData = {
+       project: _norm(payload.project),
+       team: _norm(payload.team),
+       remarks: _norm(payload.remarks),
+       submitter: (function(){ try{ return Session.getActiveUser().getEmail() || ''; }catch(_){ return ''; } })() || 'System'
+    };
+
+    console.log('[NEW_VEHICLE] Calling registerNewVehicleInFirestore for:', vehicleNumber);
+    registerNewVehicleInFirestore(vehicleNumber, metadata, entryData);
+
+    // [DISABLED] Writing to Sheet CarT_P
+    /*
     const sh = _openCarTP_();
     if (!sh) {
       return { ok: false, error: 'CarT_P not found' };
@@ -7982,7 +7645,10 @@ function submitNewVehicleRelease(payload){
     const startRow = sh.getLastRow() + 1;
     sh.getRange(startRow, 1, 1, columnCount).setValues([row]);
     console.log('[NEW_VEHICLE] Row appended at', startRow);
+    */
 
+    // [DISABLED] Catalog Update (Vehicle Sheet)
+    /*
     try {
       _upsertVehicleCatalogRow_({
         vehicleNumber: vehicleNumber,
@@ -7996,7 +7662,10 @@ function submitNewVehicleRelease(payload){
     } catch (catalogErr) {
       console.warn('[NEW_VEHICLE] Catalog update failed:', catalogErr);
     }
+    */
 
+    // [DISABLED] Writing to Vehicle Summary Sheets
+    /*
     try {
       const summaryObj = {};
       for (let i = 0; i < VEHICLE_SUMMARY_HEADER.length; i++) {
@@ -8007,23 +7676,34 @@ function submitNewVehicleRelease(payload){
     } catch (summaryErr) {
       console.warn('[NEW_VEHICLE] Vehicle_Released summary update failed:', summaryErr);
     }
+    */
 
+    // [DISABLED] Cache invalidation
+    /*
     try {
       invalidateVehicleReleasedCache('new_vehicle_release');
     } catch (cacheErr) {
       console.warn('[NEW_VEHICLE] Cache invalidation failed:', cacheErr);
     }
+    */
 
+    // [DISABLED] Sync from CarT_P
+    /*
     try {
       syncVehicleSheetFromCarTP();
     } catch (syncErr) {
       console.warn('[NEW_VEHICLE] Vehicle sheet sync failed:', syncErr);
     }
+    */
 
-    return { ok: true, status: 'RELEASE', ref: row[iRef] || baseRef };
+    return {
+       ok: true,
+       status: 'AVAILABLE', // New vehicles start as Available/Released
+       ref: 'NEW-' + Date.now()
+    };
   } catch (error) {
     console.error('[NEW_VEHICLE] submitNewVehicleRelease error:', error);
-    return { ok: false, error: String(error) };
+    return { ok: false, error: String(error && error.message ? error.message : error) };
   }
 }
 
@@ -11888,68 +11568,103 @@ function askQuestion(message){
 
 /** Read CarT_P as array of objects (tolerant headers) + parsed timestamp */
 /** Read CarT_P as array of objects (from Firestore cartp_plan) */
+/** Read CarT_P as array of objects (from Firestore cart_plan - Single Doc Model) */
 function _readCarTP_objects_(){
   try {
-     const events = getCarEventsFromFirestore();
-     // Sort by timestamp asc
-     events.sort((a,b) => {
-        const ta = a.timestamp instanceof Date ? a.timestamp.getTime() : 0;
-        const tb = b.timestamp instanceof Date ? b.timestamp.getTime() : 0;
-        return ta - tb;
-     });
-
-     // Map to compatibility layer
-     return events.map((e, idx) => {
-        const ts = e.timestamp instanceof Date ? e.timestamp.getTime() : 0;
+     // Fetch Active Fleet Status
+     const inUseDocs = queryVehiclesByStatus('IN_USE', 100);
+     const availableDocs = queryVehiclesByStatus('AVAILABLE', 100);
+     
+     const allDocs = [...inUseDocs, ...availableDocs];
+     const legacyObjects = [];
+     
+     allDocs.forEach((doc, docIdx) => {
+        // Common Vehicle Data
+        const vNum = doc.vehicleNumber || '';
+        const make = doc.make || '';
+        const model = doc.model || '';
+        const cat = doc.category || '';
+        const owner = doc.owner || '';
+        const status = doc.status || 'AVAILABLE';
         
-        // Ensure beneficiary keys are populated as legacy code expects
-        const rBen = e.beneficiary || '';
-        const specificResponsible = e.responsibleBeneficiary || rBen;
-        const specificShort = e.rBen || specificResponsible;
-
-        const obj = {
-           Ref: e.ref || '',
-           Timestamp: e.timestamp, // Keep Date object
-           'Date and time of entry': e.timestamp, // Legacy key
-           Project: e.project || '',
-           Team: e.team || '',
-           'R.Beneficiary': rBen,
-           'R. Ben': specificShort, // Use specific if available
-           responsibleBeneficiary: specificResponsible, // Use specific if available
-           'Responsible Beneficiary': specificResponsible, // Alias
-           'Name of Responsible beneficiary': specificResponsible, // Alias
-           rBenShort: specificShort, // Alias
+        if (status === 'IN_USE' && doc.currentAssignment) {
+           // Flatten Active Crew to multiple rows for legacy compatibility
+           const assign = doc.currentAssignment;
+           const crew = assign.activeCrew || [];
            
-           'R.Ben Time': e.rBenTime || '', 
-           'Previous Release Flag': e.previousReleaseFlag || '',
-           previousReleaseFlag: e.previousReleaseFlag || '',
-           
-           'Vehicle Number': e.vehicleNumber || '',
-           vehicleNumber: e.vehicleNumber || '',
-           
-           Make: e.make || '',
-           Model: e.model || '',
-           Category: e.category || '',
-           'Usage Type': e.usageType || '',
-           Owner: e.owner || '',
-           
-           Status: e.status || '', // IN USE / RELEASE
-           
-           'Last Users remarks': e.remarks || '',
-           remarks: e.remarks || '',
-           
-           Ratings: e.rating || '',
-           
-           'Submitter username': e.submitter || '',
-           
-           // Internal props required by _computeCarTPVehicleSnapshots_
-           _ts: ts,
-           _rowIndex: idx + 2 // Simulate ordering
-        };
-        return obj;
+           if (crew.length > 0) {
+               crew.forEach((member, i) => {
+                   legacyObjects.push({
+                       Ref: assign.ref || '',
+                       Timestamp: assign.startTime ? new Date(assign.startTime) : new Date(),
+                       'Date and time of entry': assign.startTime ? new Date(assign.startTime) : new Date(),
+                       Project: assign.project || '',
+                       Team: assign.team || '',
+                       
+                       // Beneficiary Mapping
+                       'R.Beneficiary': member.name,
+                       'R. Ben': member.name, 
+                       responsibleBeneficiary: member.role === 'Responsible' ? member.name : '',
+                       'Responsible Beneficiary': member.role === 'Responsible' ? member.name : '',
+                       'Name of Responsible beneficiary': member.role === 'Responsible' ? member.name : '',
+                       rBenShort: member.name,
+                       
+                       'Vehicle Number': vNum,
+                       vehicleNumber: vNum,
+                       Make: make,
+                       Model: model,
+                       Category: cat,
+                       'Usage Type': doc.usageType || '', // Ensure usageType is in schema if needed
+                       Owner: owner,
+                       Status: status,
+                       
+                       'Submitter username': assign.submitter || '',
+                       _ts: assign.startTime ? new Date(assign.startTime).getTime() : 0,
+                       _rowIndex: docIdx * 1000 + i // Fake index
+                   });
+               });
+           } else {
+               // IN_USE but no crew? Should not happen in Last Man Standing logic, but handle it.
+               legacyObjects.push({
+                   Ref: assign.ref || '',
+                   Timestamp: new Date(),
+                   'Vehicle Number': vNum,
+                   vehicleNumber: vNum,
+                   Status: 'IN_USE (Empty)',
+                   Team: assign.team || '',
+                   _ts: Date.now()
+               });
+           }
+        } else {
+           // AVAILABLE
+           legacyObjects.push({
+               Ref: '',
+               Timestamp: new Date(),
+               'Date and time of entry': new Date(),
+               Project: '',
+               Team: '',
+               'R.Beneficiary': '',
+               'Vehicle Number': vNum,
+               vehicleNumber: vNum,
+               Make: make,
+               Model: model,
+               Category: cat,
+               Owner: owner,
+               Status: 'AVAILABLE',
+               _ts: Date.now(),
+               _rowIndex: docIdx * 1000
+           });
+        }
      });
+
+     // Sort by timestamp desc or status?
+     // Users usually want to see recent assignments first.
+     legacyObjects.sort((a,b) => b._ts - a._ts);
+     
+     return legacyObjects;
+
   } catch (e) {
-     console.error('Error reading Firestore cartp_plan:', e);
+     console.error('Error reading Firestore cart_plan:', e);
      return [];
   }
 }
