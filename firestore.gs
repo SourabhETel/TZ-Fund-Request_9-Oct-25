@@ -359,3 +359,164 @@ function getConfigFirestoreClient_() {
   return null;
 }
 
+/**
+ * Persist a vehicle event (Assignment/Release) to the 'cartp_plan' Firestore collection.
+ * This replaces writing to the CarT_P Google Sheet.
+ * 
+ * @param {Object} eventData - The flattened event object (similar to what was written to the sheet).
+ */
+/**
+ * Persist a vehicle transaction (and its line items) to Firestore hierarchically.
+ * Structure: cartp_plan/{transactionId} -> cartp_lines/{itemId}
+ * 
+ * @param {Object} payload 
+ *  {
+ *    transactionId: string, // Optional, auto-generated if missing
+ *    timestamp: Date|string,
+ *    type: 'ASSIGN'|'RELEASE',
+ *    submitter: string,
+ *    rows: Array<Object> // The line items
+ *  }
+ */
+function persistCarTransactionToFirestore(payload) {
+  if (!payload || !Array.isArray(payload.rows)) {
+    throw new Error('Invalid vehicle transaction payload.');
+  }
+
+  const projectId = getFirestoreProjectId_();
+  const databaseRoot = `projects/${projectId}/databases/(default)/documents`;
+  
+  // 1. Prepare Parent Document
+  const collection = 'cartp_plan';
+  const transactionId = payload.transactionId || `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const parentPath = `${collection}/${transactionId}`;
+  
+  const parentData = {
+     transactionId: transactionId,
+     type: payload.type || 'UNKNOWN',
+     timestamp: payload.timestamp instanceof Date ? payload.timestamp.toISOString() : (payload.timestamp || new Date().toISOString()),
+     submitter: payload.submitter || '',
+     rowCount: payload.rows.length,
+     project: payload.project || '', // top-level summary
+     team: payload.team || '',       // top-level summary
+     createdAt: new Date().toISOString()
+  };
+
+  const writes = [];
+
+  // Write Parent
+  writes.push({
+    update: {
+      name: `${databaseRoot}/${parentPath}`,
+      fields: firestoreFields_(parentData)
+    }
+  });
+
+  // 2. Prepare Child Documents (cartp_lines)
+  payload.rows.forEach((row, index) => {
+     const lineId = row.ref || `row_${index}_${Math.random().toString(36).substr(2, 5)}`;
+     // Ensure we don't have slashes in IDs
+     const safeLineId = String(lineId).replace(/\//g, '_'); 
+     const linePath = `${parentPath}/cartp_lines/${safeLineId}`;
+     
+     // Ensure timestamp is ready for Firestore
+     const ts = row.timestamp instanceof Date ? row.timestamp.toISOString() : (row.timestamp || parentData.timestamp);
+     
+     const lineData = Object.assign({}, row, {
+        timestamp: ts,
+        parentId: transactionId // back-reference for convenience
+     });
+
+     writes.push({
+       update: {
+         name: `${databaseRoot}/${linePath}`,
+         fields: firestoreFields_(lineData)
+       }
+     });
+  });
+
+  // 3. Execute Batch
+  return executeFirestoreBatch(writes);
+}
+
+/**
+ * Retrieve all car events using a Collection Group Query on 'cartp_lines'.
+ * effectively flattens the hierarchy for the application view.
+ */
+function getCarEventsFromFirestore() {
+  const projectId = getFirestoreProjectId_();
+  const token = getFirestoreAccessToken_();
+  
+  // Use runQuery to perform a Collection Group Query
+  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
+  
+  const queryPayload = {
+    structuredQuery: {
+      from: [{ collectionId: 'cartp_lines', allDescendants: true }],
+      orderBy: [{ field: { fieldPath: 'timestamp' }, direction: 'ASCENDING' }]
+    }
+  };
+
+  // Note: runQuery returns a stream of results, potentially paginated or just a list
+  // The REST API for runQuery usually returns a JSON list of objects, usually [{document:..., readTime:...}]
+  
+  let documents = [];
+  
+  try {
+      const response = UrlFetchApp.fetch(url, {
+        method: 'post',
+        headers: {
+          Authorization: `Bearer ${token}`
+        },
+        contentType: 'application/json',
+        payload: JSON.stringify(queryPayload),
+        muteHttpExceptions: true
+      });
+      
+      if (response.getResponseCode() !== 200) {
+        console.error('Firestore runQuery failed', response.getContentText());
+        return [];
+      }
+      
+      const json = JSON.parse(response.getContentText());
+      // json is array of results. Each result has 'document'
+      if (Array.isArray(json)) {
+          json.forEach(item => {
+             if (item.document) {
+                 documents.push(item.document);
+             }
+          });
+      }
+  } catch (e) {
+      console.error('getCarEventsFromFirestore error:', e);
+      return [];
+  }
+  
+  // Parse documents
+  return documents.map(doc => {
+    return parseFirestoreMap_(doc.fields);
+  });
+}
+
+function parseFirestoreValue_(valueObj) {
+  if (!valueObj) return undefined;
+  if ('nullValue' in valueObj) return null;
+  if ('stringValue' in valueObj) return valueObj.stringValue;
+  if ('integerValue' in valueObj) return Number(valueObj.integerValue);
+  if ('doubleValue' in valueObj) return Number(valueObj.doubleValue);
+  if ('booleanValue' in valueObj) return valueObj.booleanValue;
+  if ('timestampValue' in valueObj) return new Date(valueObj.timestampValue);
+  if ('mapValue' in valueObj) return parseFirestoreMap_(valueObj.mapValue.fields);
+  if ('arrayValue' in valueObj) return (valueObj.arrayValue.values || []).map(parseFirestoreValue_);
+  return undefined;
+}
+
+function parseFirestoreMap_(fields) {
+    const obj = {};
+    if (!fields) return obj;
+    for (const key in fields) {
+        obj[key] = parseFirestoreValue_(fields[key]);
+    }
+    return obj;
+}
+

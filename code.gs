@@ -4815,6 +4815,7 @@ function submitCarRelease(releaseData) {
     const idxRespTimeCol = safeIdx(['R.Ben Time','R.Ben timestamp','Responsible Beneficiary Time']);
     const idxRBCol = safeIdx(['R.Beneficiary','Responsible Beneficiary','R Beneficiary','Responsible']);
     const idxRBenShortCol = safeIdx(['R. Ben','R Ben']);
+    const idxPrevFlagCol = safeIdx(['Previous Release Flag','Prev. Release Flag']);
     const shortBeneficiaryLower = shortBeneficiaryValue ? shortBeneficiaryValue.toLowerCase() : '';
 
     const lastRowExisting = sh.getLastRow();
@@ -4882,12 +4883,9 @@ function submitCarRelease(releaseData) {
         updates.push({ rowNumber: r + 2, values: updated });
       }
 
-      for (let i = 0; i < updates.length; i++) {
-        const update = updates[i];
-        sh.getRange(update.rowNumber, 1, 1, header.length).setValues([update.values]);
-      }
-    }
+    } // Close the 'if (lastRowExisting > 1 ...)' block
 
+    // [RESTORE] Calculate rowsToInsert
     const beneficiaryTargets = beneficiaryRows.length
       ? beneficiaryRows
       : (defaultBeneficiaryText ? [defaultBeneficiaryText] : []);
@@ -4915,8 +4913,58 @@ function submitCarRelease(releaseData) {
       rowsToInsert.push(rowValues.slice());
     }
 
-    const startRow = sh.getLastRow() + 1;
-    sh.getRange(startRow, 1, rowsToInsert.length, rowValues.length).setValues(rowsToInsert);
+    // [NEW] Persist Release Events to Firestore 'cartp_plan'
+    // [NEW] Persist Release Events to Firestore 'cartp_plan' (Hierarchical)
+    try {
+       const lineItems = rowsToInsert.map(row => {
+          return {
+              ref: idxRefCol >= 0 ? row[idxRefCol] : '',
+              timestamp: idxRespTimeCol >= 0 ? row[idxRespTimeCol] : (releaseData.timestamp instanceof Date ? releaseData.timestamp : new Date()),
+              // idxTeamCol is 'Team'. idxVehicleCol is 'Vehicle Number'.
+              team: idxTeamCol >= 0 ? row[idxTeamCol] : '',
+              
+              beneficiary: idxRBCol >= 0 ? row[idxRBCol] : '',
+              
+              // Explicitly capture all aliases requested
+              responsibleBeneficiary: idxRBCol >= 0 ? row[idxRBCol] : '', // Usually same as Beneficiary in Release context, or check for specific Full col
+              rBen: idxRBenShortCol >= 0 ? row[idxRBenShortCol] : '',
+              rBenTime: idxRespTimeCol >= 0 ? row[idxRespTimeCol] : null,
+              
+              previousReleaseFlag: idxPrevFlagCol >= 0 ? row[idxPrevFlagCol] : '',
+              
+              vehicleNumber: idxVehicleCol >= 0 ? row[idxVehicleCol] : '',
+              status: idxStatusCol >= 0 ? row[idxStatusCol] : 'RELEASE',
+              remarks: idxRemarksCol >= 0 ? row[idxRemarksCol] : '',
+              rating: idxStarsCol >= 0 ? row[idxStarsCol] : '',
+              submitter: idxSubmitCol >= 0 ? row[idxSubmitCol] : '',
+              action: 'RELEASE'
+          };
+       });
+
+       persistCarTransactionToFirestore({
+          type: 'RELEASE',
+          timestamp: new Date(),
+          submitter: submitter || '',
+          project: '', 
+          team: '',    
+          rows: lineItems
+       });
+
+       console.log('[RELEASE_CAR] ✅ Data successfully written to Firestore cartp_plan (Hierarchical)');
+    } catch (fsErr) {
+       console.error('[RELEASE_CAR] ❌ Firestore write failed:', fsErr);
+    }
+
+    // [DISABLED] Update existing rows in Sheet
+    //   for (let i = 0; i < updates.length; i++) {
+    //     const update = updates[i];
+    //     sh.getRange(update.rowNumber, 1, 1, header.length).setValues([update.values]);
+    //   }
+
+    // [DISABLED] Append new rows to Sheet
+    // const startRow = sh.getLastRow() + 1;
+    // sh.getRange(startRow, 1, rowsToInsert.length, rowValues.length).setValues(rowsToInsert);
+    const startRow = 0; // Placeholder
 
     try {
       const summarySource = rowsToInsert[0] || rowValues;
@@ -7460,6 +7508,7 @@ function assignCarToTeam(payload){
     const iRate  = idx(['Ratings','Stars','Rating'], false);
     const iSub   = idx(['Submitter username','Submitter','User'], false);
     const iRespTime = idx(['R.Ben Time','R.Ben timestamp','Responsible Beneficiary Time'], false);
+    const iPrevFlag = idx(['Previous Release Flag','Prev. Release Flag'], false);
 
     // Generate a base ref prefix
     const baseTs = Date.now();
@@ -7551,12 +7600,59 @@ function assignCarToTeam(payload){
         spreadsheetId: sh.getParent().getId()
       });
       
-      console.log('[ASSIGN_CAR] Data being written:', rows);
+      console.log('[ASSIGN_CAR] Data prepared (writing to Firestore instead of Sheet):', rows.length);
       
-      sh.getRange(start,1,rows.length,rows[0].length).setValues(rows);
+      // [NEW] Persist to Firestore 'cartp_plan' (Hierarchical)
+      try {
+        const lineItems = rows.map(row => {
+          return {
+              ref: iRef >= 0 ? row[iRef] : '',
+              timestamp: iDate >= 0 ? row[iDate] : new Date(),
+              project: iProj >= 0 ? row[iProj] : '',
+              team: iTeam >= 0 ? row[iTeam] : '',
+              
+              beneficiary: iResp >= 0 ? row[iResp] : '', // "R.Beneficiary" column usually
+              
+              // Explicitly capture all aliases requested
+              responsibleBeneficiary: iRespFull >= 0 ? row[iRespFull] : (iResp >= 0 ? row[iResp] : ''),
+              rBen: iRespShort >= 0 ? row[iRespShort] : '',
+              rBenTime: iRespTime >= 0 ? row[iRespTime] : null,
+              
+              previousReleaseFlag: iPrevFlag >= 0 ? row[iPrevFlag] : '',
+
+              vehicleNumber: iCarNo >= 0 ? row[iCarNo] : '',
+              make: iMake >= 0 ? row[iMake] : '',
+              model: iModel >= 0 ? row[iModel] : '',
+              category: iCat >= 0 ? row[iCat] : '',
+              usageType: iUse >= 0 ? row[iUse] : '',
+              owner: iOwner >= 0 ? row[iOwner] : '',
+              status: iStat >= 0 ? row[iStat] : 'IN USE',
+              remarks: iRem >= 0 ? row[iRem] : '',
+              rating: iRate >= 0 ? row[iRate] : '',
+              submitter: iSub >= 0 ? row[iSub] : '',
+              action: 'ASSIGN'
+          };
+        });
+
+        persistCarTransactionToFirestore({
+            type: 'ASSIGN',
+            timestamp: new Date(),
+            submitter: submitter,
+            project: project,
+            team: team,
+            rows: lineItems
+        });
+        
+        console.log('[ASSIGN_CAR] ✅ Data successfully written to Firestore cartp_plan (Hierarchical)');
+      } catch (fsErr) {
+        console.error('[ASSIGN_CAR] ❌ Firestore write failed:', fsErr);
+      }
       
-      console.log('[ASSIGN_CAR] ✅ Data successfully written to CarT_P sheet');
-      console.log('[ASSIGN_CAR] New last row after write:', sh.getLastRow());
+      // [DISABLED] Writing to Google Sheet CarT_P
+      // sh.getRange(start,1,rows.length,rows[0].length).setValues(rows);
+      
+      // console.log('[ASSIGN_CAR] ✅ Data successfully written to CarT_P sheet');
+      // console.log('[ASSIGN_CAR] New last row after write:', sh.getLastRow());
 
       try {
         rows.forEach(function(rowValues){
@@ -11791,160 +11887,71 @@ function askQuestion(message){
 }
 
 /** Read CarT_P as array of objects (tolerant headers) + parsed timestamp */
+/** Read CarT_P as array of objects (from Firestore cartp_plan) */
 function _readCarTP_objects_(){
-  const sh = _openCarTP_(); if (!sh) return [];
-  const lastRow = sh.getLastRow(); const lastCol = sh.getLastColumn(); if (lastRow<=1) return [];
-  const head = sh.getRange(1,1,1,lastCol).getDisplayValues()[0];
-  const IX = _headerIndex_(head);
-  function idx(labels, required){ try{ return IX.get(labels); }catch(e){ if(required) throw e; return -1; } }
-  const iRef  = idx(['Ref','Reference Number','Ref Number'], false);
-  const iDate = idx(['Date and time of entry','Date and time','Timestamp','Date'], false);
-  const iProj = idx(['Project'], false);
-  const iTeam = idx(['Team'], false);
-  let iCarNo = -1; try{ iCarNo = idx(['Vehicle Number','Car Number','Car No','Vehicle No','Car #','Car'], false);}catch(_){ iCarNo=-1; }
-  if (iCarNo<0) iCarNo = _findCarNumberColumn_(head);
-  const iMake  = idx(['Make','Car Make','Brand'], false);
-  const iModel = idx(['Model','Car Model'], false);
-  const iCat   = idx(['Category','Vehicle Category','Cat'], false);
-  const iUse   = idx(['Usage Type','Usage','Use Type'], false);
-  const iOwner = idx(['Owner','Owner Name','Owner Info'], false);
+  try {
+     const events = getCarEventsFromFirestore();
+     // Sort by timestamp asc
+     events.sort((a,b) => {
+        const ta = a.timestamp instanceof Date ? a.timestamp.getTime() : 0;
+        const tb = b.timestamp instanceof Date ? b.timestamp.getTime() : 0;
+        return ta - tb;
+     });
 
-  const normalizedHead = head.map(function(h){ return String(h || '').trim().toLowerCase(); });
-  const sanitizedHead = normalizedHead.map(function(h){ return h.replace(/[^a-z0-9]+/g, ''); });
-  function findHeaderIndex(predicate) {
-    for (let i = 0; i < normalizedHead.length; i++) {
-      if (predicate(normalizedHead[i], sanitizedHead[i], i)) {
-        return i;
-      }
-    }
-    return -1;
-  }
+     // Map to compatibility layer
+     return events.map((e, idx) => {
+        const ts = e.timestamp instanceof Date ? e.timestamp.getTime() : 0;
+        
+        // Ensure beneficiary keys are populated as legacy code expects
+        const rBen = e.beneficiary || '';
+        const specificResponsible = e.responsibleBeneficiary || rBen;
+        const specificShort = e.rBen || specificResponsible;
 
-  let iBeneficiary = -1;
-  const beneficiaryAliases = ['R.Beneficiary','R Beneficiary','R_Beneficiary','Team Members','Members','Member Names','Beneficiaries'];
-  for (let b = 0; b < beneficiaryAliases.length && iBeneficiary < 0; b++) {
-    try { iBeneficiary = IX.get(beneficiaryAliases[b]); } catch (_err) { iBeneficiary = -1; }
+        const obj = {
+           Ref: e.ref || '',
+           Timestamp: e.timestamp, // Keep Date object
+           'Date and time of entry': e.timestamp, // Legacy key
+           Project: e.project || '',
+           Team: e.team || '',
+           'R.Beneficiary': rBen,
+           'R. Ben': specificShort, // Use specific if available
+           responsibleBeneficiary: specificResponsible, // Use specific if available
+           'Responsible Beneficiary': specificResponsible, // Alias
+           'Name of Responsible beneficiary': specificResponsible, // Alias
+           rBenShort: specificShort, // Alias
+           
+           'R.Ben Time': e.rBenTime || '', 
+           'Previous Release Flag': e.previousReleaseFlag || '',
+           previousReleaseFlag: e.previousReleaseFlag || '',
+           
+           'Vehicle Number': e.vehicleNumber || '',
+           vehicleNumber: e.vehicleNumber || '',
+           
+           Make: e.make || '',
+           Model: e.model || '',
+           Category: e.category || '',
+           'Usage Type': e.usageType || '',
+           Owner: e.owner || '',
+           
+           Status: e.status || '', // IN USE / RELEASE
+           
+           'Last Users remarks': e.remarks || '',
+           remarks: e.remarks || '',
+           
+           Ratings: e.rating || '',
+           
+           'Submitter username': e.submitter || '',
+           
+           // Internal props required by _computeCarTPVehicleSnapshots_
+           _ts: ts,
+           _rowIndex: idx + 2 // Simulate ordering
+        };
+        return obj;
+     });
+  } catch (e) {
+     console.error('Error reading Firestore cartp_plan:', e);
+     return [];
   }
-  if (iBeneficiary < 0) {
-    iBeneficiary = findHeaderIndex(function(norm, san){
-      if (!norm) return false;
-      if (norm.indexOf('responsible') !== -1) return false;
-      if (san === 'rben') return false;
-      if (norm.indexOf('beneficiary') !== -1) return true;
-      return /\bmember\b/.test(norm);
-    });
-  }
-
-  let iRespShort = -1;
-  const respShortAliases = ['R. Ben','R Ben','RBen'];
-  for (let s = 0; s < respShortAliases.length && iRespShort < 0; s++) {
-    try { iRespShort = IX.get(respShortAliases[s]); } catch (_err) { iRespShort = -1; }
-  }
-  if (iRespShort < 0) {
-    iRespShort = findHeaderIndex(function(_norm, san){
-      return san === 'rben';
-    });
-  }
-
-  let iRespFull = -1;
-  const respFullAliases = ['Responsible Beneficiary','ResponsibleBeneficiary','Name of Responsible beneficiary','Responsible beneficiary','Name of responsible beneficiary'];
-  for (let f = 0; f < respFullAliases.length && iRespFull < 0; f++) {
-    try { iRespFull = IX.get(respFullAliases[f]); } catch (_err) { iRespFull = -1; }
-  }
-  if (iRespFull < 0) {
-    iRespFull = findHeaderIndex(function(norm, san){
-      if (!norm) return false;
-      return norm.indexOf('responsible') !== -1 && norm.indexOf('benefici') !== -1;
-    });
-  }
-
-  const iStat  = idx(['In Use/Release','In Use / release','In Use','Status'], false);
-  const iRem   = idx(['Last Users remarks','Remarks','Feedback'], false);
-  const iRate  = idx(['Ratings','Stars','Rating'], false);
-  const iSubmit= idx(['Submitter username','Submitter','User'], false);
-  const iRespTime = idx(['R.Ben Time','R.Ben timestamp','Responsible Beneficiary Time'], false);
-
-  const rng = sh.getRange(2,1,lastRow-1,lastCol);
-  const data = rng.getValues();
-  const disp = rng.getDisplayValues();
-  const out = [];
-  for (let r=0;r<data.length;r++){
-    const row = data[r];
-    const beneficiaryValue = iBeneficiary>=0 ? (row[iBeneficiary] || disp[r][iBeneficiary] || '') : '';
-    const respShortValue = iRespShort>=0 ? (row[iRespShort] || disp[r][iRespShort] || '') : '';
-    const respFullValue = iRespFull>=0 ? (row[iRespFull] || disp[r][iRespFull] || '') : '';
-
-    let responsibleCandidate = respShortValue || respFullValue || '';
-    let responsibleValue = _sanitizeResponsibleName(responsibleCandidate);
-    if (!responsibleValue && responsibleCandidate) {
-      const pieces = _splitBeneficiaryNames_(responsibleCandidate)
-        .map(_sanitizeResponsibleName)
-        .filter(Boolean);
-      if (pieces.length) responsibleValue = pieces[0];
-    }
-    if (!responsibleValue && respShortValue) {
-      const shortSanitized = _sanitizeResponsibleName(respShortValue);
-      if (shortSanitized) responsibleValue = shortSanitized;
-      else if (!responsibleCandidate) responsibleValue = respShortValue;
-    }
-    if (!responsibleValue && respFullValue) {
-      const fullSanitized = _sanitizeResponsibleName(respFullValue);
-      if (fullSanitized) responsibleValue = fullSanitized;
-      else if (!responsibleCandidate) responsibleValue = respFullValue;
-    }
-    if (!responsibleValue && beneficiaryValue) {
-      const memberPieces = _splitBeneficiaryNames_(beneficiaryValue)
-        .map(_sanitizeResponsibleName)
-        .filter(Boolean);
-      if (memberPieces.length) {
-        responsibleValue = memberPieces[0];
-      }
-    }
-
-    const obj = {
-      Ref: iRef>=0 ? (row[iRef] || disp[r][iRef] || '') : '',
-      'Date and time of entry': iDate>=0 ? (row[iDate] || disp[r][iDate] || '') : '',
-      Project: iProj>=0 ? (row[iProj] || disp[r][iProj] || '') : '',
-      Team: iTeam>=0 ? (row[iTeam] || disp[r][iTeam] || '') : '',
-      'Vehicle Number': iCarNo>=0 ? (row[iCarNo] || disp[r][iCarNo] || '') : '',
-      Make: iMake>=0 ? (row[iMake] || disp[r][iMake] || '') : '',
-      Model: iModel>=0 ? (row[iModel] || disp[r][iModel] || '') : '',
-      Category: iCat>=0 ? (row[iCat] || disp[r][iCat] || '') : '',
-      'Usage Type': iUse>=0 ? (row[iUse] || disp[r][iUse] || '') : '',
-      Owner: iOwner>=0 ? (row[iOwner] || disp[r][iOwner] || '') : '',
-      'R.Beneficiary': beneficiaryValue,
-      'R. Ben': responsibleValue || '',
-      Status: iStat>=0 ? (row[iStat] || disp[r][iStat] || '') : '',
-      'Last Users remarks': iRem>=0 ? (row[iRem] || disp[r][iRem] || '') : '',
-      Ratings: iRate>=0 ? (row[iRate] || disp[r][iRate] || '') : '',
-      'Submitter username': iSubmit>=0 ? (row[iSubmit] || disp[r][iSubmit] || '') : '',
-      'R.Ben Time': iRespTime>=0 ? (row[iRespTime] || disp[r][iRespTime] || '') : ''
-    };
-    obj._rowIndex = r + 2;
-    if (respFullValue) {
-      obj['Responsible Beneficiary'] = respFullValue;
-      obj['Name of Responsible beneficiary'] = respFullValue;
-    } else if (responsibleValue) {
-      obj['Responsible Beneficiary'] = responsibleValue;
-      obj['Name of Responsible beneficiary'] = responsibleValue;
-    }
-    if (responsibleValue) {
-      obj.responsibleBeneficiary = responsibleValue;
-      obj['R. Ben'] = responsibleValue;
-      obj.rBenShort = responsibleValue;
-    } else if (!obj.responsibleBeneficiary && obj['Responsible Beneficiary']) {
-      const sanitized = _sanitizeResponsibleName(obj['Responsible Beneficiary']);
-      if (sanitized) {
-        obj.responsibleBeneficiary = sanitized;
-        obj['R. Ben'] = sanitized;
-        obj.rBenShort = sanitized;
-      }
-    }
-    const ts = _parseTs_(obj['Date and time of entry']);
-    obj._ts = ts;
-    out.push(obj);
-  }
-  return out;
 }
 
 /** Best-effort vehicle master index from Vehicle sheet */
