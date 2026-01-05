@@ -730,3 +730,109 @@ function registerNewVehicleInFirestore(vehicleNumber, metadata, entryData) {
   return executeFirestoreBatch([write]);
 }
 
+/**
+ * Fetch all vehicles with status == 'IN_USE' from Firestore.
+ * Returns a map for efficient lookups by Beneficiary or Team.
+ * 
+ * Billing: 1 List Query (Read 1 query cost + returned docs).
+ * Ideally filtered by Project/Team if possible, but fetching all IN_USE is usually small enough (~50-100 docs) 
+ * and cheaper than individual reads per row.
+ */
+function getInUseVehiclesMap() {
+  const projectId = getFirestoreProjectId_();
+  const token = getFirestoreAccessToken_();
+  const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
+
+  // Query: status == 'IN_USE'
+  const payload = {
+    structuredQuery: {
+      from: [{ collectionId: 'cart_plan' }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: 'status' },
+          op: 'EQUAL',
+          value: { stringValue: 'IN_USE' }
+        }
+      },
+      limit: 100 // Safety limit, adjust if fleet > 100 active cars
+    }
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: `Bearer ${token}` },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const code = response.getResponseCode();
+    if(code !== 200){
+      console.warn('getInUseVehiclesMap failed:', response.getContentText());
+      return { ok: false, error: response.getContentText() };
+    }
+    const json = JSON.parse(response.getContentText());
+    
+    const benMap = {}; // beneficiaryName -> { vehicle, role, team }
+    const teamMap = {}; // teamName -> [ { vehicle, ... } ]
+
+    if (json && Array.isArray(json)) {
+       json.forEach(item => {
+          if (!item.document) return;
+          const fields = item.document.fields;
+          if (!fields) return;
+
+          const vNum = fields.vehicleNumber ? fields.vehicleNumber.stringValue : '';
+          const status = fields.status ? fields.status.stringValue : '';
+          
+          if (!vNum || status !== 'IN_USE') return;
+
+          // Parse currentAssignment
+          const assign = fields.currentAssignment ? fields.currentAssignment.mapValue : null;
+          if (!assign || !assign.fields) return;
+
+          const team = assign.fields.team ? assign.fields.team.stringValue : '';
+          const project = assign.fields.project ? assign.fields.project.stringValue : '';
+          const crew = assign.fields.activeCrew ? assign.fields.activeCrew.arrayValue : null;
+
+          const record = { vehicle: vNum, team, project };
+
+          // Map by Team
+          if (team) {
+             const tKey = team.toLowerCase().trim();
+             if (!teamMap[tKey]) teamMap[tKey] = [];
+             teamMap[tKey].push(record);
+          }
+
+          // Map by Beneficiary (Crew)
+          if (crew && crew.values) {
+             crew.values.forEach(cVal => {
+                const cObj = cVal.mapValue.fields;
+                const name = cObj.name ? cObj.name.stringValue : '';
+                const role = cObj.role ? cObj.role.stringValue : 'Beneficiary';
+                
+                if (name) {
+                   const nKey = name.toLowerCase().trim();
+                   // If duplicate (same person in multiple cars? Should not happen), last one wins
+                   benMap[nKey] = {
+                      vehicle: vNum,
+                      role: role,
+                      team: team,
+                      project: project
+                   };
+                }
+             });
+          }
+       });
+    }
+
+    return { ok: true, byBeneficiary: benMap, byTeam: teamMap };
+
+  } catch (err) {
+    console.error('getInUseVehiclesMap Firestore Error:', err);
+    return { ok: false, error: String(err) };
+  }
+}
+
